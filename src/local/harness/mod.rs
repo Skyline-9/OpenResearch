@@ -1,5 +1,5 @@
 //! The harness compatibility layer: one `Harness` trait that every coding-agent
-//! integration (Claude Code, Codex, OpenCode, Cursor) implements, plus the
+//! integration (Claude Code, Codex, OpenCode, Cursor, Antigravity) implements, plus the
 //! single `registry()` that every consumer iterates.
 //!
 //! A harness can offer up to three capabilities, and no harness is required to
@@ -530,14 +530,8 @@ pub fn is_chat_harness(id: &str) -> bool {
 
 async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
     harness.detect().await.map(|mut info| {
-        if info.auth_state == HarnessAuthState::Unknown {
-            info.auth_state = if info.agent_ready {
-                HarnessAuthState::Ready
-            } else if info.installed && !info.install_broken && info.id != "claude-code" {
-                HarnessAuthState::NeedsLogin
-            } else {
-                HarnessAuthState::Unknown
-            };
+        if info.auth_state == HarnessAuthState::Unknown && info.agent_ready {
+            info.auth_state = HarnessAuthState::Ready;
         }
         info.options = harness.options();
         // The trait is the ceiling: a `detect` narrows it for an installation
@@ -811,11 +805,15 @@ mod tests {
             permission_contract(&antigravity),
             [
                 (
-                    "ask",
-                    "Ask",
-                    "Prompt before running commands or modifying files"
+                    "default",
+                    "Default",
+                    "Use Antigravity permission rules; actions needing approval are denied"
                 ),
-                ("auto", "Auto", "Allow actions unless explicitly denied"),
+                (
+                    "accept-edits",
+                    "Accept edits",
+                    "Allow file edits; commands still follow Antigravity permission rules"
+                ),
                 (
                     "bypass",
                     "Bypass",
@@ -823,7 +821,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(antigravity.default_permission_mode, Some("auto"));
+        assert_eq!(antigravity.default_permission_mode, Some("default"));
         assert_eq!(antigravity.plan_activation, Some(PlanActivation::Command));
         assert_eq!(
             reasoning_ids(&antigravity),

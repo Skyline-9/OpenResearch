@@ -36,6 +36,7 @@ use crate::commands::remote_host::{DashboardLock, DashboardLockMode, HostDescrip
 use crate::error::{anyhow, Result};
 use crate::local;
 use crate::local::chat::ChatHost;
+use crate::local::is_terminal;
 use crate::local::opencode::AgentHost;
 use crate::store::{
     log_path, now_ms, SshHostTest, Store, StoredAgentSelection, StoredChatSession, StoredRun,
@@ -43,6 +44,8 @@ use crate::store::{
 use crate::updates;
 use crate::workspace_state::{GlobalWorkspaceState, WorkspaceState};
 use crate::{browser, UpArgs};
+
+mod harness_setup;
 
 pub async fn run(args: UpArgs) -> Result<()> {
     let port = args.port;
@@ -62,6 +65,8 @@ pub async fn run(args: UpArgs) -> Result<()> {
             DashboardLockMode::Shared
         },
     )?;
+    // Blocks only for a relaunched server, whose predecessor still holds the port.
+    updates::await_replaced_parent();
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(listener) => listener,
         // A second double-click should reach the running dashboard, not fail on its port.
@@ -629,6 +634,11 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route("/api/harnesses", get(list_harnesses))
         .route(
+            "/api/harnesses/setup/commands",
+            get(harness_setup::commands),
+        )
+        .route("/api/harnesses/setup", get(harness_setup::connect))
+        .route(
             "/api/local-models",
             get(list_local_models).post(connect_local_model),
         )
@@ -753,6 +763,7 @@ fn remote_route_forbidden(path: &str) -> bool {
             | "/api/settings/ssh/connect"
             | "/api/settings/openresearch/ssh-key"
             | "/api/settings/openresearch/login"
+            | "/api/harnesses/setup"
     ) || path.starts_with("/api/remote/")
         || (path.starts_with("/api/projects/") && path.ends_with("/file/open"))
 }
@@ -1311,6 +1322,7 @@ async fn resolve_paper_api(Query(q): Query<PaperResolveQ>) -> ApiResult {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateProjectReq {
+    creation_mode: Option<crate::telemetry::ProjectCreationMode>,
     name: String,
     path: String,
     run_command: Option<String>,
@@ -1415,7 +1427,7 @@ async fn create_project(
     } else {
         (project, None)
     };
-    crate::telemetry::capture_project_created(true);
+    crate::telemetry::capture_project_created(true, req.creation_mode);
     Ok(Json(json!({
         "project": project_json(&project),
         "githubPublicationError": github_publication_error,
@@ -2355,7 +2367,8 @@ struct StarterPromptsQuery {
 
 /// Four starter prompts for the empty chat, written by a model that has read
 /// the project (paper, README, code). Slow on a cache miss — one headless
-/// model call — so the UI shows a placeholder while it waits.
+/// model call — so the UI shows a placeholder while it waits. A blank project
+/// is flagged instead so the UI shows its pre-written prompts.
 async fn project_starter_prompts(
     Path(id): Path<String>,
     Query(q): Query<StarterPromptsQuery>,
@@ -2377,23 +2390,24 @@ async fn project_starter_prompts(
         .filter(|h| local::harness::is_chat_harness(h));
     // Past "getting started" or no chat harness named: nothing to offer
     // (empty), as opposed to a harness that could not answer (null).
-    let prompts = match harness {
-        Some(harness) if experiment_count == 0 => {
-            let locale = q.locale.as_deref().unwrap_or("en");
-            let agent = local::starter::Agent {
-                harness: harness.to_string(),
-                model: q
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|m| !m.is_empty())
-                    .map(String::from),
-            };
-            local::starter::prompts(&project, &agent, locale).await
-        }
-        _ => Some(Vec::new()),
+    let Some(harness) = harness.filter(|_| experiment_count == 0) else {
+        return Ok(Json(json!({ "prompts": [], "blank": false })));
     };
-    Ok(Json(json!({ "prompts": prompts })))
+    let locale = q.locale.as_deref().unwrap_or("en");
+    let agent = local::starter::Agent {
+        harness: harness.to_string(),
+        model: q
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from),
+    };
+    let (prompts, blank) = match local::starter::prompts(&project, &agent, locale).await {
+        local::starter::Starter::Blank => (Some(Vec::new()), true),
+        local::starter::Starter::Generated(prompts) => (prompts, false),
+    };
+    Ok(Json(json!({ "prompts": prompts, "blank": blank })))
 }
 
 /// Live uncommitted changes in the project's clone (the agent's working
@@ -4271,7 +4285,7 @@ fn spawn_agent_preflight() {
         eprintln!("orx up: agents: {}", line.join(" · "));
         if !harnesses.iter().any(|h| h.agent_ready) {
             eprintln!(
-                "orx up: warning: no coding agent ready — install Claude Code, Codex, OpenCode or Cursor, then connect a local model or sign in."
+                "orx up: warning: no coding agent ready — install Claude Code, Codex, OpenCode, Cursor or Antigravity, then connect a local model or sign in."
             );
         }
     });
@@ -5011,6 +5025,8 @@ async fn telemetry_settings() -> ApiResult {
 struct UiEventReq {
     name: String,
     #[serde(default)]
+    choice: Option<String>,
+    #[serde(default)]
     step: Option<String>,
     #[serde(default)]
     kind: Option<String>,
@@ -5026,6 +5042,11 @@ struct UiEventReq {
 
 async fn record_ui_event(Json(req): Json<UiEventReq>) -> ApiResult {
     match req.name.as_str() {
+        "demo_welcome_choice" => {
+            if let Some(choice) = req.choice.as_deref() {
+                crate::telemetry::capture_demo_welcome_choice(choice);
+            }
+        }
         "onboarding_step_viewed" => {
             if let Some(step) = req.step.as_deref() {
                 crate::telemetry::capture_onboarding_step_viewed(step);
@@ -5108,12 +5129,6 @@ async fn restart_after_update(State(state): State<AppState>) -> ApiResult {
     let status = tokio::task::spawn_blocking(updates::status)
         .await
         .map_err(|e| ApiError::from(anyhow!("update status task failed: {e}")))?;
-    if !status.can_restart {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "orx cannot restart itself on this platform".into(),
-        ));
-    }
     let Some(version) = status.installed_version else {
         return Err(ApiError(
             StatusCode::CONFLICT,
@@ -5475,6 +5490,14 @@ pub(crate) async fn ssh_connect_to_target(
 }
 
 fn start_pty(program: &str, args: Vec<String>) -> Result<PtySession> {
+    start_pty_with_env(program, args, &[])
+}
+
+fn start_pty_with_env(
+    program: &str,
+    args: Vec<String>,
+    env: &[(&str, std::ffi::OsString)],
+) -> Result<PtySession> {
     use std::io::{Read as _, Write as _};
 
     let pair = native_pty_system().openpty(PtySize {
@@ -5485,6 +5508,9 @@ fn start_pty(program: &str, args: Vec<String>) -> Result<PtySession> {
     })?;
     let mut command = CommandBuilder::new(program);
     command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut child = pair.slave.spawn_command(command)?;
     drop(pair.slave);
 
@@ -5587,7 +5613,7 @@ async fn ssh_connect_socket(
             return;
         }
     };
-    let Some(status) = relay_pty(&mut socket, session).await else {
+    let Some(status) = relay_pty(&mut socket, session, None).await else {
         return;
     };
 
@@ -5638,6 +5664,7 @@ async fn ssh_connect_socket(
 async fn relay_pty(
     socket: &mut WebSocket,
     session: PtySession,
+    mut output: Option<&mut String>,
 ) -> Option<std::result::Result<portable_pty::ExitStatus, String>> {
     let PtySession {
         master,
@@ -5654,6 +5681,7 @@ async fn relay_pty(
         tokio::select! {
             event = events.recv() => match event {
                 Some(PtyEvent::Output(bytes)) => {
+                    if let Some(output) = output.as_deref_mut() { harness_setup::append_output(output, &bytes); }
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         return None;
                     }
@@ -5695,6 +5723,9 @@ async fn relay_pty(
     {
         match event {
             PtyEvent::Output(bytes) => {
+                if let Some(output) = output.as_deref_mut() {
+                    harness_setup::append_output(output, &bytes);
+                }
                 if socket.send(Message::Binary(bytes.into())).await.is_err() {
                     return None;
                 }
@@ -5719,6 +5750,10 @@ async fn openresearch_terminal(
     ws: WebSocketUpgrade,
     args: Vec<String>,
 ) -> Response {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe.to_string_lossy().into_owned(),
+        Err(error) => return ApiError::from(anyhow!(error)).into_response(),
+    };
     if !same_origin(&headers) {
         return ApiError(
             StatusCode::FORBIDDEN,
@@ -5728,12 +5763,8 @@ async fn openresearch_terminal(
     }
     ws.on_upgrade(move |mut socket| async move {
         let result = async {
-            let session = tokio::task::spawn_blocking(move || {
-                let exe = std::env::current_exe()?;
-                start_pty(&exe.to_string_lossy(), args)
-            })
-            .await??;
-            let Some(status) = relay_pty(&mut socket, session).await else {
+            let session = tokio::task::spawn_blocking(move || start_pty(&exe, args)).await??;
+            let Some(status) = relay_pty(&mut socket, session, None).await else {
                 return Ok::<_, anyhow::Error>(None);
             };
             let status = status.map_err(|error| anyhow!(error))?;
@@ -5918,8 +5949,14 @@ async fn ssh_master_status(Query(req): Query<SshPreflightReq>) -> ApiResult {
     if host.is_empty() {
         return Err(bad_request("host is required"));
     }
-    let running =
-        crate::jobs::ssh::master_is_running(&crate::jobs::ssh::SshTarget::alias(host)).await?;
+    // A missing master is meaningful only on platforms that support multiplexing.
+    // Windows opens a new SSH connection for each command; reporting false here
+    // makes a successful preflight immediately look disconnected in the dashboard.
+    let running = if cfg!(unix) {
+        Some(crate::jobs::ssh::master_is_running(&crate::jobs::ssh::SshTarget::alias(host)).await?)
+    } else {
+        None
+    };
     Ok(Json(json!({ "running": running })))
 }
 
@@ -6707,6 +6744,7 @@ async fn list_harnesses(
                 {
                     let mut payload = payload.clone();
                     overlay_claude_auth(&mut payload, snapshot);
+                    crate::telemetry::harness::capture_initial(&payload);
                     return Json(payload);
                 }
             }
@@ -6757,7 +6795,48 @@ async fn list_harnesses(
         );
     }
     overlay_claude_auth(&mut payload, snapshot);
-    *cache = Some((std::time::Instant::now(), payload.clone()));
+    crate::telemetry::harness::capture_initial(&payload);
+    let cached_at = std::time::Instant::now();
+    let cursor = payload["harnesses"].as_array_mut().and_then(|items| {
+        items
+            .iter_mut()
+            .find(|h| h["id"] == "cursor" && h["authenticated"] == true)
+    });
+    if let Some(cursor) = cursor {
+        if let Some(bin) = cursor["binPath"].as_str().map(std::path::PathBuf::from) {
+            cursor["accountLoading"] = json!(true);
+            let cache = state.harnesses.clone();
+            tokio::spawn(async move {
+                let details = local::harness::cursor::account_details(&bin).await;
+                let mut cache = cache.lock().await;
+                let Some((at, payload)) = cache.as_mut() else {
+                    return;
+                };
+                // A newer detection owns its own account lookup.
+                if *at != cached_at {
+                    return;
+                }
+                let Some(cursor) = payload["harnesses"]
+                    .as_array_mut()
+                    .and_then(|items| items.iter_mut().find(|h| h["id"] == "cursor"))
+                else {
+                    return;
+                };
+                cursor["accountLoading"] = json!(false);
+                if let Some(details) = details {
+                    for (source, target) in [("userEmail", "account"), ("subscriptionTier", "plan")]
+                    {
+                        if let Some(value) =
+                            details[source].as_str().filter(|value| !value.is_empty())
+                        {
+                            cursor[target] = json!(value);
+                        }
+                    }
+                }
+            });
+        }
+    }
+    *cache = Some((cached_at, payload.clone()));
     Json(payload)
 }
 
@@ -7641,10 +7720,6 @@ fn push_log_delta(
     ));
 }
 
-fn is_terminal(status: &str) -> bool {
-    matches!(status, "done" | "failed" | "cancelled")
-}
-
 fn log_size(run_id: &str) -> u64 {
     std::fs::metadata(log_path(run_id))
         .map(|m| m.len())
@@ -7864,6 +7939,17 @@ mod tests {
             serde_json::from_str(r#"{"type":"resize","cols":120,"rows":40}"#).unwrap();
         let SshTerminalInput::Resize { cols, rows } = input;
         assert_eq!((cols, rows), (120, 40));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ssh_master_status_is_not_a_disconnection() {
+        let response = ssh_master_status(Query(SshPreflightReq {
+            host: "unused-host".into(),
+        }))
+        .await
+        .unwrap_or_else(|error| panic!("{}", error.1));
+        assert!(response.0["running"].is_null());
     }
 
     #[test]

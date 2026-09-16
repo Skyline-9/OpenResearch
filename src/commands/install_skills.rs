@@ -1,5 +1,5 @@
 //! `orx install-skills` — drop a thin "skill" shim into the local coding agents
-//! (Claude Code, Codex, OpenCode, Cursor) so they auto-discover how to drive
+//! (Claude Code, Codex, OpenCode, Cursor, Antigravity) so they auto-discover how to drive
 //! `orx`.
 //!
 //! The shim, its target path, and each agent's config home all live on the

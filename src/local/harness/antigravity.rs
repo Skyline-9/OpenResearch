@@ -2,13 +2,13 @@
 //!
 //! Chat: one `agy --output-format stream-json` child per turn. Multi-turn continues
 //! via `--conversation <conversation_id>` from the init/result `conversation_id`. Isolated
-//! ORX worktrees are the child's current working directory and added workspace (`--add-dir`).
+//! ORX worktrees are the child's current working directory.
 //!
 //! The playbook is pointed at on the first turn (the file is already in the
 //! worktree via [`ensure_playbook`]); session skills land in `.agents/skills`.
 //!
-//! Options: Ask prompts before changes, Auto allows changes unless denied, and
-//! Bypass passes `--dangerously-skip-permissions`.
+//! Headless approval requests are denied; permission choices expose the CLI policy.
+//! Bypass explicitly passes `--dangerously-skip-permissions`.
 //!
 //! Detection: `agy` on PATH or in `~/.local/bin` / `~/.gemini/antigravity-cli/bin`;
 //! `agy models` for catalog and authentication verification.
@@ -24,23 +24,20 @@ use tokio::process::Command;
 
 use super::detect::{probe_bin, resolve_symlinks, HarnessAuthState, HarnessInfo, ModelInfo};
 use super::options::{
-    HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
+    resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
+    REASONING_DEFAULT_ID,
 };
-use super::{
-    Harness, OneShot, OneShotQuality, ResumeAction, TurnFailure, TurnOutcome, TurnResult,
-    TURN_WATCHDOG,
-};
+use super::{Harness, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG};
 use crate::error::{anyhow, Result};
 use crate::local::chat::{
     find_part_mut, harness_log, prepare_env, set_chat_session_env, DeliveryState, PromptAnswer,
     ResumeCtx, TurnCtx, WirePart, WirePrompt, WireToolState,
 };
-use crate::local::native_store::{self, NativeStore};
 use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
 use crate::local::shell_env::{find_in_dir, find_on_path};
 
 const AGY_REINSTALL: &str =
-    "Reinstall Antigravity CLI via curl -sSf https://antigravity.google/install | sh";
+    "Reinstall Antigravity CLI via curl -fsSL https://antigravity.google/cli/install.sh | bash";
 const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Antigravity;
@@ -65,36 +62,39 @@ impl Harness for Antigravity {
             info.record_bin(&bin, probe_bin(&bin).await);
         }
         if info.installed && !info.install_broken {
-            let authed = match info.bin_path.as_deref().map(Path::new) {
-                Some(bin) => check_auth_ready(bin).await,
-                None => false,
-            };
-            if authed {
-                info.authenticated = true;
-                info.auth_state = HarnessAuthState::Ready;
-                info.auth_method = Some("oauth");
-            } else {
-                info.auth_state = HarnessAuthState::NeedsLogin;
+            if let Some(bin) = info.bin_path.as_deref().map(Path::new) {
+                match agy_model_list(bin).await {
+                    Ok(models) => {
+                        info.authenticated = true;
+                        info.auth_state = HarnessAuthState::Ready;
+                        info.auth_method = Some("cli");
+                        info = info.with_models(models);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        info.auth_state = if message.to_lowercase().contains("sign in") {
+                            HarnessAuthState::NeedsLogin
+                        } else {
+                            HarnessAuthState::Unknown
+                        };
+                        info.agent_note = Some(message);
+                    }
+                }
             }
         }
-
         info.agent_ready = info.ready();
         if info.agent_ready {
-            let models = match info.bin_path.as_deref().map(Path::new) {
-                Some(bin) => agy_model_list(bin).await,
-                None => None,
-            };
-            info = info.with_models(models.unwrap_or_else(fallback_models));
+            return Some(info);
         } else if info.install_broken {
             info.agent_note = Some(info.broken_note(AGY_REINSTALL));
-        } else if info.installed {
+        } else if info.installed && info.agent_note.is_none() {
             info.agent_note = Some(
                 "Sign in by running `agy` in your terminal, then re-check this harness."
                     .to_string(),
             );
-        } else {
+        } else if !info.installed {
             info.agent_note = Some(
-                "Install Antigravity CLI with `curl -sSf https://antigravity.google/install | sh`, then sign in with `agy`."
+                "Install Antigravity CLI with `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then sign in with `agy`."
                     .to_string(),
             );
         }
@@ -113,14 +113,14 @@ impl Harness for Antigravity {
             .with_permission_choices(
                 vec![
                     OptionChoice::described(
-                        "ask",
-                        "Ask",
-                        "Prompt before running commands or modifying files",
+                        "default",
+                        "Default",
+                        "Use Antigravity permission rules; actions needing approval are denied",
                     ),
                     OptionChoice::described(
-                        "auto",
-                        "Auto",
-                        "Allow actions unless explicitly denied",
+                        "accept-edits",
+                        "Accept edits",
+                        "Allow file edits; commands still follow Antigravity permission rules",
                     ),
                     OptionChoice::described(
                         "bypass",
@@ -128,7 +128,7 @@ impl Harness for Antigravity {
                         "Allow commands and skip tool confirmation prompts",
                     ),
                 ],
-                "auto",
+                "default",
                 PlanActivation::Command,
             )
             .with_reasoning_levels(&["low", "medium", "high"])
@@ -146,29 +146,15 @@ impl Harness for Antigravity {
         if !answer.approve && answer.note.as_deref().is_none_or(|s| s.trim().is_empty()) {
             return Ok(ResumeAction::Nothing);
         }
-        let note = answer.note.as_deref().filter(|s| !s.trim().is_empty());
-        let (text, plan_mode) = if answer.approve {
-            let mut text = "Implement the plan.".to_string();
-            if let Some(note) = note {
-                text.push_str(&format!("\n\nAdditional guidance: {note}"));
-            }
-            (text, false)
-        } else {
-            (super::synthesize_resume("plan", answer).0, true)
-        };
         Ok(ResumeAction::SendMessage {
-            text,
+            text: super::synthesize_resume("plan", answer).0,
             mode: None,
-            plan_mode: Some(plan_mode),
+            plan_mode: Some(!answer.approve),
         })
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        agy_one_shot(&find_agy()?, request).await
-    }
-
     fn config_home(&self) -> Option<PathBuf> {
-        Some(native_store::antigravity_home(NativeStore::Legacy))
+        Some(dirs::home_dir()?.join(".gemini").join("antigravity-cli"))
     }
 
     fn skill_target(&self) -> Option<PathBuf> {
@@ -178,20 +164,6 @@ impl Harness for Antigravity {
                 .join("orx")
                 .join("SKILL.md"),
         )
-    }
-
-    fn extra_skill_targets(&self) -> Vec<(PathBuf, &'static str)> {
-        dirs::home_dir()
-            .map(|h| {
-                vec![(
-                    h.join(".agents")
-                        .join("skills")
-                        .join("orx")
-                        .join("SKILL.md"),
-                    super::CLAUDE_SKILL,
-                )]
-            })
-            .unwrap_or_default()
     }
 
     fn skill_shim(&self) -> Option<&'static str> {
@@ -215,56 +187,41 @@ pub(crate) fn find_agy() -> Option<PathBuf> {
                 find_in_dir(&agy_bin, "agy")
             })
         })
+        .or_else(|| find_in_dir(&dirs::data_local_dir()?.join("agy").join("bin"), "agy"))
         .map(resolve_symlinks)
 }
 
-async fn check_auth_ready(bin: &Path) -> bool {
+async fn agy_model_list(bin: &Path) -> Result<Vec<ModelInfo>> {
     let mut cmd = Command::new(bin);
-    cmd.args(["models"])
+    cmd.arg("models")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     prepare_env(&mut cmd);
     cmd.env("NO_COLOR", "1");
-
-    if let Ok(Ok(out)) = tokio::time::timeout(MODELS_TIMEOUT, cmd.output()).await {
-        return out.status.success();
-    }
-    false
-}
-
-async fn agy_model_list(bin: &Path) -> Option<Vec<ModelInfo>> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["models"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    prepare_env(&mut cmd);
-    cmd.env("NO_COLOR", "1");
-
     let out = tokio::time::timeout(MODELS_TIMEOUT, cmd.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| {
+            anyhow!("Antigravity model discovery timed out. Re-check when connected.")
+        })??;
     if !out.status.success() {
-        return None;
+        let error = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!(
+            "Antigravity model discovery failed: {}",
+            error.trim()
+        ));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let parsed = parse_agy_model_list(&text);
-    (!parsed.is_empty()).then_some(parsed)
+    let models = parse_agy_model_list(&String::from_utf8_lossy(&out.stdout));
+    if models.is_empty() {
+        return Err(anyhow!(
+            "Antigravity returned no available models. Re-check your account."
+        ));
+    }
+    Ok(models)
 }
 
-fn fallback_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo::new("gemini-3.8-flash-high").with_label(Some("Gemini 3.8 Flash (High)"), None),
-        ModelInfo::new("gemini-3.1-pro-high").with_label(Some("Gemini 3.1 Pro (High)"), None),
-        ModelInfo::new("claude-sonnet-4-6").with_label(Some("Claude Sonnet 4.6 (Thinking)"), None),
-    ]
-}
-
-/// Parse `agy models` output. Lines are tab-separated `<id>\t<label>`, ignoring
+/// Parse the whitespace-separated model catalog, ignoring
 /// informational banner lines such as `Fetching available models...`.
 fn parse_agy_model_list(text: &str) -> Vec<ModelInfo> {
     text.lines()
@@ -277,7 +234,7 @@ fn parse_agy_model_list(text: &str) -> Vec<ModelInfo> {
             {
                 return None;
             }
-            let (id, label) = line.split_once('\t').unwrap_or((line, ""));
+            let (id, label) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
             let id = id.trim();
             let label = label.trim();
             if id.is_empty()
@@ -292,47 +249,6 @@ fn parse_agy_model_list(text: &str) -> Vec<ModelInfo> {
             Some(ModelInfo::new(id).with_label((!label.is_empty()).then_some(label), None))
         })
         .collect()
-}
-
-async fn agy_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
-    let message = if request.system.is_empty() {
-        request.prompt.to_string()
-    } else {
-        format!("{}\n\n{}", request.system, request.prompt)
-    };
-    let mut cmd = Command::new(bin);
-    cmd.args([
-        "--output-format",
-        "text",
-        "--effort",
-        if matches!(request.quality, OneShotQuality::Cheap) {
-            "low"
-        } else {
-            "medium"
-        },
-    ]);
-    if let Some(model) = request.model.filter(|model| !model.is_empty()) {
-        cmd.args(["--model", model]);
-    } else if matches!(request.quality, OneShotQuality::Cheap) {
-        cmd.args(["--model", "gemini-3.8-flash-low"]);
-    }
-    cmd.arg(format!("--print={message}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .current_dir(std::env::temp_dir());
-    prepare_env(&mut cmd);
-    cmd.env("NO_COLOR", "1");
-    let out = tokio::time::timeout(request.timeout, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
 }
 
 fn first_turn_prompt(text: &str) -> String {
@@ -355,43 +271,24 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 
     let resume = ctx.native_session_id.clone();
     let mut prompt = ctx.text.clone();
-    if ctx.native_session_id.is_some() && resume.is_none() {
-        if let Some(recovery) = super::native_recovery_context(ctx, "Antigravity") {
-            prompt = format!("{recovery}\n\n{prompt}");
-        }
-    }
     if resume.is_none() {
         prompt = first_turn_prompt(&prompt);
     }
 
     let mut cmd = Command::new(&bin);
-    // Crucial: Pass all option flags before `--print`
     cmd.args(["--output-format", "stream-json"]);
 
     if let Some(model) = ctx.model.as_deref().filter(|model| !model.is_empty()) {
         cmd.args(["--model", model]);
     }
 
-    if let Some(effort) = &ctx.reasoning_level {
-        if matches!(effort.as_str(), "low" | "medium" | "high") {
-            cmd.args(["--effort", effort]);
-        }
+    if let Some(effort) =
+        resolve_reasoning(ctx.reasoning_level.as_deref(), &["low", "medium", "high"])
+    {
+        cmd.args(["--effort", effort]);
     }
-
-    if ctx.plan_mode || ctx.permission_mode == Some(PermissionMode::Plan) {
-        cmd.args(["--mode", "plan"]);
-    } else {
-        match ctx.permission_mode.unwrap_or(PermissionMode::Auto) {
-            PermissionMode::Ask => {}
-            PermissionMode::AcceptEdits => {
-                cmd.args(["--mode", "accept-edits"]);
-            }
-            PermissionMode::Bypass => {
-                cmd.arg("--dangerously-skip-permissions");
-            }
-            PermissionMode::Auto | PermissionMode::Plan => {}
-        }
-    }
+    cmd.args(permission_args(ctx.permission_mode, ctx.plan_mode));
+    cmd.args(["--print-timeout", "30m"]);
 
     if let Some(native_id) = &resume {
         cmd.args(["--conversation", native_id]);
@@ -399,7 +296,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 
     cmd.arg(format!("--print={prompt}"));
     cmd.current_dir(&repo);
-    cmd.args(["--add-dir", repo.to_string_lossy().as_ref()]);
 
     let log_name = format!("antigravity-{}", uuid::Uuid::new_v4());
     cmd.stdin(Stdio::null())
@@ -429,7 +325,12 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
                 let Ok(event) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                ctx.mark_delivery(DeliveryState::Accepted);
+                if matches!(
+                    event.get("event").and_then(Value::as_str),
+                    Some("step_update")
+                ) {
+                    ctx.mark_delivery(DeliveryState::Accepted);
+                }
                 let terminal = apply_event(ctx, &mut state, &event);
                 if let Some(sid) = state.conversation_id.as_deref() {
                     ctx.set_native_session_id(sid);
@@ -452,22 +353,82 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         }
     }
 
-    let status = child
-        .wait()
+    let status = tokio::time::timeout(TURN_WATCHDOG, child.wait())
         .await
-        .map_err(|error| anyhow!("wait for Antigravity child: {error}"))?;
-
-    if !status.success() && !state.saw_result {
+        .map_err(|_| anyhow!("Antigravity did not exit after its response"))??;
+    let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
+    if !state.saw_result {
+        return Err(anyhow!(
+            "Antigravity ended without a result ({status}); see {}",
+            log_path.display()
+        ));
+    }
+    if !status.success() && !state.turn_errored {
         return Err(anyhow!("Antigravity ended with error ({status})"));
     }
-
-    if (ctx.plan_mode || ctx.permission_mode == Some(PermissionMode::Plan)) && !state.turn_errored {
-        if let Some(card) = plan_card(&ctx.assistant.parts, &ctx.assistant.id, state.turn_errored) {
+    if ctx.plan_mode && !state.turn_errored {
+        if let Some(card) = plan_card(&ctx.assistant.parts, &ctx.assistant.id) {
             ctx.upsert_part(card);
         }
     }
-
+    if !state.turn_errored {
+        let _ = std::fs::remove_file(log_path);
+    }
     Ok(())
+}
+
+fn permission_args(mode: Option<PermissionMode>, plan: bool) -> Vec<&'static str> {
+    let mode_arg = if plan {
+        "--mode=plan"
+    } else if matches!(
+        mode,
+        Some(PermissionMode::AcceptEdits | PermissionMode::Bypass)
+    ) {
+        "--mode=accept-edits"
+    } else {
+        "--mode=default"
+    };
+    let mut args = vec![mode_arg];
+    if mode == Some(PermissionMode::Bypass) && !plan {
+        args.push("--dangerously-skip-permissions");
+    }
+    args
+}
+
+fn normalize_tool<'a>(name: &'a str, params: Option<&Value>) -> (&'a str, Option<Value>) {
+    let (tool, aliases): (&str, &[(&str, &str)]) = match name {
+        "run_command" => ("Bash", &[("CommandLine", "command")]),
+        "view_file" => ("Read", &[("AbsolutePath", "file_path")]),
+        "write_to_file" => (
+            "Write",
+            &[("TargetFile", "file_path"), ("CodeContent", "content")],
+        ),
+        "replace_file_content" | "multi_replace_file_content" => {
+            ("Edit", &[("TargetFile", "file_path")])
+        }
+        "list_dir" => ("Glob", &[("DirectoryPath", "path")]),
+        "grep_search" | "code_search" => ("Grep", &[("Query", "pattern"), ("SearchPath", "path")]),
+        "find_by_name" => (
+            "Glob",
+            &[("Pattern", "pattern"), ("SearchDirectory", "path")],
+        ),
+        "read_url_content" => ("WebFetch", &[("Url", "url")]),
+        "search_web" => ("WebSearch", &[]),
+        _ => (name, &[]),
+    };
+    let mut input = params.cloned();
+    if let Some(object) = input.as_mut().and_then(Value::as_object_mut) {
+        for &(native, normalized) in aliases {
+            if let Some(value) = object.get(native).cloned() {
+                object.insert(normalized.into(), value);
+            }
+        }
+    }
+    (tool, input)
+}
+
+fn error_text(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| value.get("message")?.as_str())
 }
 
 #[derive(Default)]
@@ -483,14 +444,22 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
     let event_type = event.get("event").and_then(Value::as_str).unwrap_or("");
     match event_type {
         "init" => {
-            if let Some(cid) = event.get("conversation_id").and_then(Value::as_str) {
+            if let Some(cid) = event
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
                 state.conversation_id = Some(cid.to_string());
             }
             false
         }
         "step_update" => {
             if let Some(step) = event.get("step_update") {
-                if let Some(cid) = step.get("conversation_id").and_then(Value::as_str) {
+                if let Some(cid) = step
+                    .get("conversation_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
                     state.conversation_id = Some(cid.to_string());
                 }
                 let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
@@ -528,22 +497,16 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                             step.get("step_index").and_then(Value::as_i64).unwrap_or(0);
                         let call_id = format!("tool-{step_index}-{tool_name}");
 
-                        let title = match tool_name {
-                            "run_command" => "Bash",
-                            "view_file" => "Read",
-                            "write_to_file" | "replace_file_content" => "Edit",
-                            "list_dir" | "grep_search" | "find_by_name" => "Search",
-                            "read_url_content" | "search_web" => "Web",
-                            other => other,
-                        };
-
                         let is_done = step_state == "DONE";
-                        let params = tool_info.get("parameters").cloned();
+                        let (tool, params) = normalize_tool(tool_name, tool_info.get("parameters"));
                         let output = tool_info.get("output").and_then(Value::as_str);
-                        let error = tool_info.get("error").and_then(Value::as_str);
+                        let error = tool_info.get("error").and_then(error_text);
 
                         if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &call_id) {
                             if let Some(part_state) = part.state.as_mut() {
+                                if params.is_some() {
+                                    part_state.input = params;
+                                }
                                 if is_done {
                                     part_state.status = if error.is_some() {
                                         "error"
@@ -573,13 +536,13 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                 id: call_id,
                                 kind: "tool".into(),
                                 text: None,
-                                tool: Some(tool_name.to_string()),
+                                tool: Some(tool.to_string()),
                                 state: Some(WireToolState {
                                     status: status.into(),
                                     input: params,
                                     output: output.map(str::to_string),
                                     error: error.map(str::to_string),
-                                    title: Some(title.to_string()),
+                                    title: None,
                                 }),
                                 prompt: None,
                                 phase: None,
@@ -594,21 +557,25 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         "result" => {
             state.saw_result = true;
-            if let Some(res) = event.get("result") {
-                if let Some(cid) = res.get("conversation_id").and_then(Value::as_str) {
-                    state.conversation_id = Some(cid.to_string());
-                }
-                let status = res.get("status").and_then(Value::as_str).unwrap_or("");
-                if status == "ERROR" {
-                    state.turn_errored = true;
-                    let err = res
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Antigravity execution failed");
-                    ctx.push_error(err.to_string());
-                } else {
-                    ctx.mark_final_text_tail();
-                }
+            let res = event.get("result").unwrap_or(&Value::Null);
+            if let Some(cid) = res
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                state.conversation_id = Some(cid.to_string());
+            }
+            let status = res
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("INVALID");
+            if status != "SUCCESS" {
+                state.turn_errored = true;
+                let error = res.get("error").and_then(error_text).unwrap_or(status);
+                ctx.mark_terminal_failure("antigravity_terminal", format!("Antigravity: {error}"));
+            } else {
+                ctx.mark_delivery(DeliveryState::Accepted);
+                ctx.mark_final_text_tail();
             }
             true
         }
@@ -616,29 +583,14 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
     }
 }
 
-fn plan_card(parts: &[WirePart], assistant_id: &str, errored: bool) -> Option<WirePart> {
-    let last_text = parts
-        .iter()
-        .rev()
-        .find_map(|part| {
-            if part.tool.as_deref() != Some("CreatePlan") {
-                return None;
-            }
-            let state = part.state.as_ref()?;
-            (state.status == "completed")
-                .then(|| state.input.as_ref()?.get("plan")?.as_str())
-                .flatten()
-                .filter(|plan| !plan.trim().is_empty())
-        })
-        .or_else(|| {
-            parts.iter().rev().find_map(|part| {
-                (part.kind == "text")
-                    .then_some(part.text.as_deref())
-                    .flatten()
-                    .filter(|text| !text.trim().is_empty())
-            })
-        })?;
-    if !super::should_synthesize_plan(true, false, errored, last_text) {
+fn plan_card(parts: &[WirePart], assistant_id: &str) -> Option<WirePart> {
+    let last_text = parts.iter().rev().find_map(|part| {
+        (part.kind == "text")
+            .then_some(part.text.as_deref())
+            .flatten()
+            .filter(|text| !text.trim().is_empty())
+    })?;
+    if !super::should_synthesize_plan(true, false, false, last_text) {
         return None;
     }
     Some(WirePart::prompt(
@@ -758,7 +710,8 @@ mod tests {
         assert_eq!(ctx.assistant.parts[1].kind, "tool");
         let tool_state = ctx.assistant.parts[1].state.as_ref().unwrap();
         assert_eq!(tool_state.status, "completed");
-        assert_eq!(tool_state.title.as_deref(), Some("Bash"));
+        assert_eq!(ctx.assistant.parts[1].tool.as_deref(), Some("Bash"));
+        assert_eq!(tool_state.input.as_ref().unwrap()["command"], "ls -la");
         assert_eq!(tool_state.output.as_deref(), Some("file.txt\n"));
 
         assert_eq!(ctx.assistant.parts[2].kind, "text");
@@ -785,24 +738,66 @@ mod tests {
     }
 
     #[test]
-    fn error_result_marks_turn_errored() {
-        let (ctx, state) = fold(&[json!({
-            "event": "result",
-            "result": {
-                "conversation_id": "conv-err",
-                "status": "ERROR",
-                "error": "Quota limit exceeded"
-            }
-        })]);
-        assert!(state.saw_result);
-        assert!(state.turn_errored);
+    fn non_success_results_never_finish_the_answer() {
+        for status in [
+            "ERROR",
+            "CANCELED",
+            "INTERRUPTED",
+            "INVALID",
+            "WAITING",
+            "RUNNING",
+        ] {
+            let (ctx, state) = fold(&[json!({
+                "event": "result",
+                "result": {"conversation_id": "", "status": status, "error": "Quota limit exceeded"}
+            })]);
+            assert!(state.saw_result);
+            assert!(state.turn_errored, "{status}");
+            assert!(state.conversation_id.is_none());
+            assert!(ctx.assistant.parts.is_empty());
+        }
+    }
+
+    #[test]
+    fn tool_updates_preserve_inputs_and_surface_object_errors() {
+        let (ctx, _) = fold(&[
+            json!({"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"parameters":{"AbsolutePath":"/repo/file.rs"}}}}),
+            json!({"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"view_file","tool_info":{"error":{"type":"permission","message":"Denied"}}}}),
+        ]);
+        let part = &ctx.assistant.parts[0];
+        assert_eq!(part.tool.as_deref(), Some("Read"));
+        let state = part.state.as_ref().unwrap();
+        assert_eq!(state.status, "error");
+        assert_eq!(state.error.as_deref(), Some("Denied"));
+        assert_eq!(state.input.as_ref().unwrap()["file_path"], "/repo/file.rs");
+        for name in [
+            "write_to_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+        ] {
+            let (_, input) = normalize_tool(name, Some(&json!({"TargetFile":"/repo/file.rs"})));
+            assert_eq!(input.unwrap()["file_path"], "/repo/file.rs");
+        }
+    }
+
+    #[test]
+    fn permissions_match_advertised_native_modes() {
+        assert_eq!(permission_args(None, false), ["--mode=default"]);
         assert_eq!(
-            ctx.assistant
-                .parts
-                .last()
-                .and_then(|p| p.state.as_ref())
-                .and_then(|s| s.error.as_deref()),
-            Some("Quota limit exceeded")
+            permission_args(Some(PermissionMode::Ask), false),
+            ["--mode=default"]
+        );
+        assert_eq!(
+            permission_args(Some(PermissionMode::AcceptEdits), false),
+            ["--mode=accept-edits"]
+        );
+        assert_eq!(
+            permission_args(Some(PermissionMode::Bypass), false),
+            ["--mode=accept-edits", "--dangerously-skip-permissions"]
+        );
+        assert_eq!(
+            permission_args(Some(PermissionMode::Bypass), true),
+            ["--mode=plan"]
         );
     }
 
@@ -810,7 +805,7 @@ mod tests {
     fn parses_agy_model_list_output() {
         let sample = "Fetching available models...\n\
                       gemini-3.8-flash-high\tGemini 3.8 Flash (High)\n\
-                      gemini-3.1-pro-high\tGemini 3.1 Pro (High)\n\
+                      gemini-3.1-pro-high    Gemini 3.1 Pro (High)\n\
                       claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n";
         let models = parse_agy_model_list(sample);
         assert_eq!(models.len(), 3);
@@ -821,67 +816,5 @@ mod tests {
         );
         assert_eq!(models[1].id, "gemini-3.1-pro-high");
         assert_eq!(models[2].id, "claude-sonnet-4-6");
-    }
-
-    #[tokio::test]
-    async fn live_detect_antigravity_if_installed() {
-        if find_agy().is_none() {
-            return;
-        }
-        let info = Antigravity.detect().await;
-        assert!(info.is_some());
-        let info = info.unwrap();
-        assert_eq!(info.id, "antigravity");
-        assert!(info.installed);
-        assert!(!info.install_broken);
-        assert!(info.agent_ready);
-        assert!(!info.models.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_one_shot_antigravity_if_installed() {
-        if find_agy().is_none() {
-            return;
-        }
-        let reply = Antigravity
-            .one_shot(OneShot {
-                system: "",
-                prompt: "respond with the single word PONG",
-                quality: OneShotQuality::Cheap,
-                model: None,
-                timeout: Duration::from_secs(20),
-            })
-            .await;
-        assert!(reply.is_some());
-        let reply = reply.unwrap();
-        assert!(reply.to_lowercase().contains("pong"));
-    }
-
-    #[tokio::test]
-    async fn live_generate_title_if_installed() {
-        if find_agy().is_none() {
-            return;
-        }
-        let title = Antigravity
-            .generate_title("Add support for Google Antigravity harness", None)
-            .await;
-        assert!(title.is_some());
-        let title = title.unwrap();
-        assert!(!title.is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_registry_detects_antigravity_if_installed() {
-        if find_agy().is_none() {
-            return;
-        }
-        let harnesses = crate::local::harness::detect_harnesses().await;
-        let agy_harness = harnesses.into_iter().find(|h| h.id == "antigravity");
-        assert!(agy_harness.is_some());
-        let agy = agy_harness.unwrap();
-        assert_eq!(agy.name, "Google Antigravity");
-        assert!(agy.installed);
-        assert!(agy.agent_ready);
-        assert!(!agy.models.is_empty());
     }
 }

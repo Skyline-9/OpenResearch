@@ -9,6 +9,7 @@ import { useRuntime } from "./RemoteRuntime";
 import { clearReadDemoSessions } from "./demoSessionState";
 import { globalResumeLocation, projectResumeLocation } from "./routeResume";
 import { getRememberedGlobalWorkspace, globalWorkspaceWriter } from "./workspacePersistence";
+import { initialPanelWidth } from "./panelLayout";
 import { m } from "./paraglide/messages.js";
 import { Onboarding } from "./components/Onboarding";
 import { ProjectsHome } from "./components/ProjectsHome";
@@ -79,7 +80,7 @@ export function ProjectsPage() {
     document.title = "OpenResearch";
     if (!state) return;
     globalWorkspaceWriter.queue({
-      ...(getRememberedGlobalWorkspace() ?? state.workspace ?? { railOpen: true, panelWidth: 760, experimentsView: "table" }),
+      ...(getRememberedGlobalWorkspace() ?? state.workspace ?? { railOpen: true, panelWidth: initialPanelWidth(), experimentsView: "table" }),
       lastLocation: "/projects",
     });
   }, [state]);
@@ -92,6 +93,7 @@ export function ProjectsPage() {
         : !projects || !state ? <RoutePending />
           : projects.length === 0 && !state.onboardingCompleted ? (
             <Onboarding
+              remote={runtime.kind === "ssh"}
               preferredAgent={state.preferredAgent}
               onDone={(project) => {
                 clearReadDemoSessions();
