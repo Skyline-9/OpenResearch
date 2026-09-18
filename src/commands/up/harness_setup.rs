@@ -281,7 +281,13 @@ async fn run(
         };
         *follow_up = Some(shell_env);
         let mut output = String::new();
-        match super::relay_pty(socket, session, Some(&mut output), size).await {
+        let completed =
+            if request.harness == "antigravity" && matches!(request.action, Action::Login) {
+                Some(antigravity_prompt_ready as fn(&str) -> bool)
+            } else {
+                None
+            };
+        match super::relay_pty(socket, session, Some(&mut output), size, completed).await {
             Some(Ok(status)) if status.success() => attempt.record(
                 "command_completed",
                 "command",
@@ -368,6 +374,11 @@ fn setup_verified(
     }
 }
 
+// The interactive CLI stays open after login; verify auth after its chat prompt appears.
+fn antigravity_prompt_ready(output: &str) -> bool {
+    output.contains("Antigravity CLI") && output.contains("for shortcuts")
+}
+
 pub(super) fn append_output(output: &mut String, bytes: &[u8]) {
     output.push_str(&String::from_utf8_lossy(bytes));
     if output.len() > 65536 {
@@ -379,6 +390,19 @@ pub(super) fn append_output(output: &mut String, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_login_waits_for_chat_prompt() {
+        assert!(!antigravity_prompt_ready(
+            "Welcome to Antigravity CLI! Choose your color scheme:"
+        ));
+        assert!(!antigravity_prompt_ready(
+            "Antigravity CLI Terms of Service & Data Use [Done]"
+        ));
+        assert!(antigravity_prompt_ready(
+            "Antigravity CLI 1.2.5\naccount@example.com\n? for shortcuts"
+        ));
+    }
 
     #[test]
     fn automatic_setup_reinstalls_broken_opencode_and_rechecks_healthy_installs() {

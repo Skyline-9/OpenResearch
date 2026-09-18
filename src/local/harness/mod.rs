@@ -806,31 +806,20 @@ mod tests {
             [
                 (
                     "default",
-                    "Default",
-                    "Use Antigravity permission rules; actions needing approval are denied"
-                ),
-                (
-                    "accept-edits",
-                    "Accept edits",
-                    "Allow file edits; commands still follow Antigravity permission rules"
+                    "Ask for approval",
+                    "Ask before changes; allow read-only planning"
                 ),
                 (
                     "bypass",
-                    "Bypass",
+                    "Bypass permissions",
                     "Allow commands and skip tool confirmation prompts"
                 ),
             ]
         );
         assert_eq!(antigravity.default_permission_mode, Some("default"));
         assert_eq!(antigravity.plan_activation, Some(PlanActivation::Command));
-        assert_eq!(
-            reasoning_ids(&antigravity),
-            ["default", "low", "medium", "high"]
-        );
-        assert_eq!(
-            antigravity.default_reasoning_level.as_deref(),
-            Some(REASONING_DEFAULT_ID)
-        );
+        assert!(reasoning_ids(&antigravity).is_empty());
+        assert!(antigravity.default_reasoning_level.is_none());
     }
 
     /// Every advertised permission-mode id must round-trip through

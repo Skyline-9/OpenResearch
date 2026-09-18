@@ -7,11 +7,9 @@
 //! The playbook is pointed at on the first turn (the file is already in the
 //! worktree via [`ensure_playbook`]); session skills land in `.agents/skills`.
 //!
-//! Headless approval requests are denied; permission choices expose the CLI policy.
-//! Bypass explicitly passes `--dangerously-skip-permissions`.
+//! Headless tools use the OpenResearch approval hook; explicit bypass skips its cards.
 //!
-//! Detection: `agy` on PATH or in `~/.local/bin` / `~/.gemini/bin` /
-//! `~/.gemini/antigravity-cli/bin`;
+//! Detection: `agy` on PATH or in `~/.local/bin`, `~/.gemini/bin`, or `~/.gemini/antigravity-cli/bin`;
 //! `agy models` for catalog and authentication verification.
 
 use std::path::{Path, PathBuf};
@@ -20,13 +18,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{probe_bin, resolve_symlinks, HarnessAuthState, HarnessInfo, ModelInfo};
 use super::options::{
-    resolve_reasoning, HarnessOptions, OptionChoice, PermissionMode, PlanActivation,
-    REASONING_DEFAULT_ID,
+    HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
 };
 use super::{Harness, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG};
 use crate::error::{anyhow, Result};
@@ -68,7 +65,7 @@ impl Harness for Antigravity {
                     Ok(models) => {
                         info.authenticated = true;
                         info.auth_state = HarnessAuthState::Ready;
-                        info.auth_method = Some("cli");
+                        info.auth_method = Some("oauth");
                         info = info.with_models(models);
                     }
                     Err(error) => {
@@ -110,37 +107,53 @@ impl Harness for Antigravity {
     }
 
     fn options(&self) -> HarnessOptions {
-        HarnessOptions::none()
-            .with_permission_choices(
-                vec![
-                    OptionChoice::described(
-                        "default",
-                        "Default",
-                        "Use Antigravity permission rules; actions needing approval are denied",
-                    ),
-                    OptionChoice::described(
-                        "accept-edits",
-                        "Accept edits",
-                        "Allow file edits; commands still follow Antigravity permission rules",
-                    ),
-                    OptionChoice::described(
-                        "bypass",
-                        "Bypass",
-                        "Allow commands and skip tool confirmation prompts",
-                    ),
-                ],
-                "default",
-                PlanActivation::Command,
-            )
-            .with_reasoning_levels(&["low", "medium", "high"])
+        HarnessOptions::none().with_permission_choices(
+            vec![
+                OptionChoice::described(
+                    "default",
+                    "Ask for approval",
+                    "Ask before changes; allow read-only planning",
+                ),
+                OptionChoice::described(
+                    "bypass",
+                    "Bypass permissions",
+                    "Allow commands and skip tool confirmation prompts",
+                ),
+            ],
+            "default",
+            PlanActivation::Command,
+        )
     }
 
     async fn resume_from_prompt(
         &self,
-        _ctx: &ResumeCtx,
+        ctx: &ResumeCtx,
         prompt: &WirePrompt,
         answer: &PromptAnswer,
     ) -> Result<ResumeAction> {
+        if prompt.kind == "permission" {
+            if let Some(native_id) = &prompt.native_id {
+                if !ctx.is_busy().await {
+                    ctx.host
+                        .resolve_zombie_prompt(&ctx.session_id, &answer.prompt_id);
+                    return Err(anyhow!("this approval is no longer pending"));
+                }
+                let decision = if answer.approve {
+                    crate::local::chat::PermissionDecision::Allow {
+                        updated_input: prompt.tool_input.clone(),
+                    }
+                } else {
+                    crate::local::chat::PermissionDecision::Deny {
+                        message: format!(
+                            "The user denied this action. Do not retry it. {}",
+                            answer.note.as_deref().unwrap_or("")
+                        ),
+                    }
+                };
+                ctx.host.settle_permission(native_id, decision)?;
+                return Ok(ResumeAction::Handled { plan_mode: None });
+            }
+        }
         if prompt.kind != "plan" {
             return Ok(ResumeAction::Nothing);
         }
@@ -176,7 +189,7 @@ impl Harness for Antigravity {
     }
 }
 
-/// `agy` on PATH, else search common install locations under `~/.local/bin`,
+/// `agy` on PATH, else search common install locations under `~/.local/bin`
 /// `~/.gemini/bin`, or `~/.gemini/antigravity-cli/bin`.
 pub(crate) fn find_agy() -> Option<PathBuf> {
     find_on_path("agy")
@@ -228,15 +241,13 @@ fn parse_agy_model_list(text: &str) -> Vec<ModelInfo> {
     text.lines()
         .filter_map(|line| {
             let line = line.trim();
-            if line.is_empty()
-                || line.starts_with("Fetching")
+            if line.starts_with("Fetching")
                 || line.starts_with("Available")
                 || line.starts_with("Listing")
             {
                 return None;
             }
             let (id, label) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
-            let id = id.trim();
             let label = label.trim();
             if id.is_empty()
                 || id == REASONING_DEFAULT_ID
@@ -270,6 +281,11 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             .await
             .map_err(|e| anyhow!("playbook task failed: {e}"))??;
 
+    let up_port = ctx
+        .host
+        .up_port()
+        .ok_or_else(|| anyhow!("Antigravity requires the OpenResearch approval bridge"))?;
+    write_approval_hook(&repo)?;
     let resume = ctx.native_session_id.clone();
     let mut prompt = ctx.text.clone();
     if resume.is_none() {
@@ -277,36 +293,53 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     }
 
     let mut cmd = Command::new(&bin);
-    cmd.args(["--output-format", "stream-json"]);
+    cmd.args([
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+    ]);
 
     if let Some(model) = ctx.model.as_deref().filter(|model| !model.is_empty()) {
         cmd.args(["--model", model]);
     }
 
-    if let Some(effort) =
-        resolve_reasoning(ctx.reasoning_level.as_deref(), &["low", "medium", "high"])
-    {
-        cmd.args(["--effort", effort]);
+    // Native headless permission checks deny even after a hook allows the action.
+    cmd.arg("--dangerously-skip-permissions");
+    if ctx.plan_mode {
+        cmd.arg("--mode=plan");
     }
-    cmd.args(permission_args(ctx.permission_mode, ctx.plan_mode));
-    cmd.args(["--print-timeout", "30m"]);
+    cmd.args(["--print-timeout", "60m"]);
 
     if let Some(native_id) = &resume {
         cmd.args(["--conversation", native_id]);
     }
 
-    cmd.arg(format!("--print={prompt}"));
     cmd.current_dir(&repo);
+    cmd.arg("--add-dir").arg(&repo);
 
     let log_name = format!("antigravity-{}", uuid::Uuid::new_v4());
-    cmd.stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(harness_log(&log_name)?))
         .kill_on_drop(true);
 
     prepare_env(&mut cmd);
     cmd.env("NO_COLOR", "1");
-    set_chat_session_env(&mut cmd, &ctx.session_id, "antigravity", ctx.host.up_port());
+    set_chat_session_env(&mut cmd, &ctx.session_id, "antigravity", Some(up_port));
+    cmd.env("ORX_SESSION_ID", &ctx.session_id);
+    cmd.env(
+        "ORX_GATE_TOKEN",
+        ctx.host.mint_gate_token(&ctx.session_id, ctx.plan_mode),
+    );
+    cmd.env(
+        "ORX_AGY_GATE",
+        if ctx.permission_mode == Some(PermissionMode::Bypass) && !ctx.plan_mode {
+            "bypass"
+        } else {
+            "ask"
+        },
+    );
 
     ctx.persist_delivery(DeliveryState::Unknown)?;
     let mut child = match cmd.spawn() {
@@ -316,6 +349,14 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             return Err(anyhow!("Could not spawn {}: {}", bin.display(), error));
         }
     };
+    let mut cancellation = TurnProcesses(child.id());
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    let message =
+        serde_json::json!({"event":"user","message":{"content":prompt}}).to_string() + "\n";
+    tokio::time::timeout(TURN_WATCHDOG, stdin.write_all(message.as_bytes()))
+        .await
+        .map_err(|_| anyhow!("Antigravity did not read the prompt"))??;
+    drop(stdin);
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut lines = BufReader::new(stdout).lines();
     let mut state = TurnState::default();
@@ -345,6 +386,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
             Ok(Err(error)) => {
                 return Err(anyhow!("antigravity stdout: {error}"));
             }
+            Err(_) if ctx.host.has_pending_permission(&ctx.session_id) => continue,
             Err(_) => {
                 return Err(anyhow!(
                     "Antigravity went silent for {} minutes and was interrupted.",
@@ -357,6 +399,7 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     let status = tokio::time::timeout(TURN_WATCHDOG, child.wait())
         .await
         .map_err(|_| anyhow!("Antigravity did not exit after its response"))??;
+    cancellation.0 = None;
     let log_path = crate::store::data_dir().join(format!("agent-{log_name}.log"));
     if !state.saw_result {
         return Err(anyhow!(
@@ -378,26 +421,139 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     Ok(())
 }
 
-fn permission_args(mode: Option<PermissionMode>, plan: bool) -> Vec<&'static str> {
-    let mut args = if plan {
-        vec!["--mode=plan"]
-    } else if matches!(
-        mode,
-        Some(PermissionMode::AcceptEdits | PermissionMode::Bypass)
-    ) {
-        vec!["--mode=accept-edits"]
-    } else {
-        Vec::new()
-    };
-    if mode == Some(PermissionMode::Bypass) && !plan {
-        args.push("--dangerously-skip-permissions");
+struct TurnProcesses(Option<u32>);
+
+impl Drop for TurnProcesses {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            stop_turn_process(pid);
+        }
     }
-    args
 }
 
-fn normalize_tool<'a>(name: &'a str, params: Option<&Value>) -> (&'a str, Option<Value>) {
+#[cfg(unix)]
+fn stop_turn_process(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // Freeze each parent before discovering children: agy commands create their own sessions.
+    if unsafe { libc::kill(pid, libc::SIGSTOP) } != 0 {
+        return;
+    }
+    let snapshot = std::process::Command::new("ps")
+        .args(["-ww", "-axo", "pid=,ppid=,args="])
+        .output();
+    let supervisor_exe = std::env::current_exe().ok();
+    match snapshot {
+        Ok(output) if output.status.success() => {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Some(child) = turn_child(line, pid, supervisor_exe.as_deref()) {
+                    stop_turn_process(child);
+                }
+            }
+        }
+        _ => eprintln!("Could not inspect Antigravity descendants during cancellation"),
+    }
+    // SAFETY: this is the owned child or a descendant observed while its parent was stopped.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn turn_child(line: &str, parent: libc::pid_t, supervisor_exe: Option<&Path>) -> Option<u32> {
+    let mut fields = line.trim().splitn(2, char::is_whitespace);
+    let pid = fields.next()?.parse().ok()?;
+    let mut fields = fields.next()?.trim_start().splitn(2, char::is_whitespace);
+    if fields.next()?.parse::<libc::pid_t>().ok()? != parent {
+        return None;
+    }
+    let command = fields.next()?.trim_start();
+    if let Some((exe, _)) = command.split_once(" supervise ") {
+        if supervisor_exe.is_some_and(|expected| Path::new(exe) == expected)
+            || (Path::new(exe).file_name().is_some_and(|name| name == "orx")
+                && Path::new(exe).is_file())
+        {
+            return None;
+        }
+    }
+    Some(pid)
+}
+
+#[cfg(not(unix))]
+fn stop_turn_process(pid: u32) {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$processes = @(Get-CimInstance Win32_Process)
+function Stop-TurnProcess([uint32] $processId) {
+    $children = @($processes | Where-Object { $_.ParentProcessId -eq $processId })
+    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        if ($child.Name -eq 'orx.exe' -and $child.CommandLine -match '^(?:"[^"\r\n]+"|\S+)\s+supervise\s') { continue }
+        Stop-TurnProcess $child.ProcessId
+    }
+}
+Stop-TurnProcess ([uint32] $env:ORX_STOP_PID)
+"#;
+    let result = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("ORX_STOP_PID", pid.to_string())
+        .stdout(Stdio::null())
+        .status();
+    if !result.is_ok_and(|status| status.success()) {
+        eprintln!("Could not inspect Antigravity descendants during cancellation");
+    }
+}
+
+fn write_approval_hook(repo: &Path) -> Result<()> {
+    let tracked = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", ".agents/hooks.json"])
+        .current_dir(repo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if tracked.success() {
+        return Err(anyhow!("This project tracks .agents/hooks.json. Antigravity approval setup requires an untracked hook file and will not modify the tracked file."));
+    }
+    let path = repo.join(".agents/hooks.json");
+    let mut hooks = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<Value>(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    let object = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Antigravity hooks must be an object"))?;
+    let exe = std::env::current_exe()?;
+    #[cfg(not(windows))]
+    let command = format!(
+        "{} antigravity-gate",
+        crate::jobs::ssh::sh_quote(&exe.to_string_lossy())
+    );
+    #[cfg(windows)]
+    let command = {
+        anyhow::ensure!(
+            exe.file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("orx.exe")),
+            "The Antigravity approval bridge requires the executable name orx.exe"
+        );
+        // prepare_env puts this executable's directory first on PATH.
+        "orx antigravity-gate".to_string()
+    };
+    object.insert("openresearch-approval".into(), serde_json::json!({
+        "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
+    }));
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(path, serde_json::to_vec_pretty(&hooks)?)?;
+    Ok(())
+}
+
+pub(crate) fn normalize_tool<'a>(
+    name: &'a str,
+    params: Option<&Value>,
+) -> (&'a str, Option<Value>) {
     let (tool, aliases): (&str, &[(&str, &str)]) = match name {
-        "run_command" => ("Bash", &[("CommandLine", "command")]),
+        "run_command" => ("Bash", &[("CommandLine", "command"), ("Cwd", "cwd")]),
         "view_file" => ("Read", &[("AbsolutePath", "file_path")]),
         "write_to_file" => (
             "Write",
@@ -534,45 +690,40 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
 
                         let (tool, params) = normalize_tool(tool_name, tool_info.get("parameters"));
                         let output = tool_info.get("output").and_then(Value::as_str);
-                        let error = tool_info
-                            .get("error")
-                            .and_then(error_text)
-                            .map(str::to_string)
-                            .or_else(|| match step_state {
-                                "ERROR" => Some("Antigravity tool failed".into()),
-                                "CANCELED" => Some("Antigravity tool was canceled".into()),
-                                _ => None,
-                            });
-                        let is_terminal = step_is_terminal(step_state) || error.is_some();
-                        let is_failed =
-                            matches!(step_state, "ERROR" | "CANCELED") || error.is_some();
+                        let error =
+                            tool_info
+                                .get("error")
+                                .and_then(error_text)
+                                .or(match step_state {
+                                    "ERROR" => Some("Antigravity tool failed"),
+                                    "CANCELED" => Some("Antigravity tool was canceled"),
+                                    _ => None,
+                                });
+                        let is_done = step_is_terminal(step_state) || error.is_some();
 
+                        let status = if !is_done {
+                            "running"
+                        } else if error.is_some() {
+                            "error"
+                        } else {
+                            "completed"
+                        };
                         if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &call_id) {
                             if let Some(part_state) = part.state.as_mut() {
                                 if params.is_some() {
                                     part_state.input = params;
                                 }
-                                if is_terminal {
-                                    part_state.status =
-                                        if is_failed { "error" } else { "completed" }.into();
+                                if is_done {
+                                    part_state.status = status.into();
                                     if let Some(out) = output {
                                         part_state.output = Some(out.to_string());
                                     }
-                                    if let Some(err) = &error {
-                                        part_state.error = Some(err.clone());
+                                    if let Some(err) = error {
+                                        part_state.error = Some(err.to_string());
                                     }
                                 }
                             }
                         } else {
-                            let status = if is_terminal {
-                                if is_failed {
-                                    "error"
-                                } else {
-                                    "completed"
-                                }
-                            } else {
-                                "running"
-                            };
                             ctx.upsert_part(WirePart {
                                 id: call_id,
                                 kind: "tool".into(),
@@ -582,7 +733,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                     status: status.into(),
                                     input: params,
                                     output: output.map(str::to_string),
-                                    error,
+                                    error: error.map(str::to_string),
                                     title: None,
                                 }),
                                 prompt: None,
@@ -826,6 +977,102 @@ mod tests {
     }
 
     #[test]
+    fn permission_denial_is_not_a_successful_turn() {
+        let (ctx, state) = fold(&[
+            json!({"event":"step_update","step_update":{"step_index":2,"state":"ERROR","step_type":"tool","tool_name":"view_file","tool_info":{"error":{"type":"TOOL_ERROR","message":"Permission denied"}}}}),
+            json!({"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"read_file","display_name":"ViewFile"}]}}),
+        ]);
+        assert!(state.turn_errored);
+        let tool = ctx.assistant.parts[0].state.as_ref().unwrap();
+        assert_eq!(tool.status, "error");
+        assert_eq!(tool.error.as_deref(), Some("Permission denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_preserves_detached_experiment_supervisors() {
+        let supervisor = Some(Path::new("/path with spaces/orx"));
+        assert_eq!(
+            turn_child(" 12 10 /bin/sh -c sleep 60", 10, supervisor),
+            Some(12)
+        );
+        assert_eq!(turn_child(" 13 12 sleep 60", 10, supervisor), None);
+        assert_eq!(
+            turn_child(
+                " 14 10 /path with spaces/orx supervise run-id",
+                10,
+                supervisor
+            ),
+            None
+        );
+        assert_eq!(
+            turn_child(
+                " 17 10 /bin/sh -c /path with spaces/orx supervise run-id",
+                10,
+                supervisor
+            ),
+            Some(17)
+        );
+        assert_eq!(
+            turn_child(" 15 10 /path/orx exp run experiment-id", 10, supervisor),
+            Some(15)
+        );
+        assert_eq!(
+            turn_child(" 16 10 python -c print('supervise')", 10, supervisor),
+            Some(16)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_command_descendants() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let cancellation = TurnProcesses(child.id());
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let pid: libc::pid_t = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        drop(cancellation);
+        child.wait().await.unwrap();
+        for _ in 0..100 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("command descendant survived cancellation: {pid}");
+    }
+
+    #[test]
+    fn approval_setup_leaves_tracked_hooks_untouched() {
+        let repo = std::env::temp_dir().join(format!("orx-agy-hooks-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(repo.join(".agents")).unwrap();
+        let path = repo.join(".agents/hooks.json");
+        std::fs::write(&path, "{}").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["add", ".agents/hooks.json"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(write_approval_hook(&repo)
+            .unwrap_err()
+            .to_string()
+            .contains("tracks .agents/hooks.json"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn failed_tool_states_are_terminal_even_without_error_payloads() {
         for (step_state, expected_error) in [
             ("ERROR", "Antigravity tool failed"),
@@ -905,24 +1152,6 @@ mod tests {
             "denied_actions": [{"display_name": "RunCommand"}]
         }))
         .is_none());
-    }
-
-    #[test]
-    fn permissions_match_advertised_native_modes() {
-        assert!(permission_args(None, false).is_empty());
-        assert!(permission_args(Some(PermissionMode::Ask), false).is_empty());
-        assert_eq!(
-            permission_args(Some(PermissionMode::AcceptEdits), false),
-            ["--mode=accept-edits"]
-        );
-        assert_eq!(
-            permission_args(Some(PermissionMode::Bypass), false),
-            ["--mode=accept-edits", "--dangerously-skip-permissions"]
-        );
-        assert_eq!(
-            permission_args(Some(PermissionMode::Bypass), true),
-            ["--mode=plan"]
-        );
     }
 
     #[test]
