@@ -10,7 +10,8 @@
 //! Headless approval requests are denied; permission choices expose the CLI policy.
 //! Bypass explicitly passes `--dangerously-skip-permissions`.
 //!
-//! Detection: `agy` on PATH or in `~/.local/bin` / `~/.gemini/antigravity-cli/bin`;
+//! Detection: `agy` on PATH or in `~/.local/bin` / `~/.gemini/bin` /
+//! `~/.gemini/antigravity-cli/bin`;
 //! `agy models` for catalog and authentication verification.
 
 use std::path::{Path, PathBuf};
@@ -175,17 +176,17 @@ impl Harness for Antigravity {
     }
 }
 
-/// `agy` on PATH, else search common install locations under `~/.local/bin`
-/// or `~/.gemini/antigravity-cli/bin`.
+/// `agy` on PATH, else search common install locations under `~/.local/bin`,
+/// `~/.gemini/bin`, or `~/.gemini/antigravity-cli/bin`.
 pub(crate) fn find_agy() -> Option<PathBuf> {
     find_on_path("agy")
         .or_else(|| {
             let home = dirs::home_dir()?;
             let local = home.join(".local").join("bin");
-            find_in_dir(&local, "agy").or_else(|| {
-                let agy_bin = home.join(".gemini").join("antigravity-cli").join("bin");
-                find_in_dir(&agy_bin, "agy")
-            })
+            let gemini = home.join(".gemini");
+            find_in_dir(&local, "agy")
+                .or_else(|| find_in_dir(&gemini.join("bin"), "agy"))
+                .or_else(|| find_in_dir(&gemini.join("antigravity-cli").join("bin"), "agy"))
         })
         .or_else(|| find_in_dir(&dirs::data_local_dir()?.join("agy").join("bin"), "agy"))
         .map(resolve_symlinks)
@@ -378,17 +379,16 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
 }
 
 fn permission_args(mode: Option<PermissionMode>, plan: bool) -> Vec<&'static str> {
-    let mode_arg = if plan {
-        "--mode=plan"
+    let mut args = if plan {
+        vec!["--mode=plan"]
     } else if matches!(
         mode,
         Some(PermissionMode::AcceptEdits | PermissionMode::Bypass)
     ) {
-        "--mode=accept-edits"
+        vec!["--mode=accept-edits"]
     } else {
-        "--mode=default"
+        Vec::new()
     };
-    let mut args = vec![mode_arg];
     if mode == Some(PermissionMode::Bypass) && !plan {
         args.push("--dangerously-skip-permissions");
     }
@@ -429,6 +429,41 @@ fn normalize_tool<'a>(name: &'a str, params: Option<&Value>) -> (&'a str, Option
 
 fn error_text(value: &Value) -> Option<&str> {
     value.as_str().or_else(|| value.get("message")?.as_str())
+}
+
+fn step_is_terminal(state: &str) -> bool {
+    matches!(state, "DONE" | "ERROR" | "CANCELED")
+}
+
+fn denied_actions_error(result: &Value) -> Option<String> {
+    if result
+        .get("response")
+        .and_then(Value::as_str)
+        .is_some_and(|response| !response.trim().is_empty())
+    {
+        return None;
+    }
+    let actions = result.get("denied_actions")?.as_array()?;
+    if actions.is_empty() {
+        return None;
+    }
+    let names = actions
+        .iter()
+        .filter_map(|action| {
+            action
+                .get("display_name")
+                .or_else(|| action.get("action"))
+                .and_then(Value::as_str)
+        })
+        .collect::<Vec<_>>();
+    Some(if names.is_empty() {
+        "Antigravity denied one or more required actions".into()
+    } else {
+        format!(
+            "Antigravity denied required action(s): {}",
+            names.join(", ")
+        )
+    })
 }
 
 #[derive(Default)]
@@ -482,7 +517,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                 ctx.append_part_text(&id, delta);
                             }
                         }
-                        if step_state == "DONE" {
+                        if step_is_terminal(step_state) {
                             state.text_part_id = None;
                         }
                     }
@@ -497,34 +532,40 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                             step.get("step_index").and_then(Value::as_i64).unwrap_or(0);
                         let call_id = format!("tool-{step_index}-{tool_name}");
 
-                        let is_done = step_state == "DONE";
                         let (tool, params) = normalize_tool(tool_name, tool_info.get("parameters"));
                         let output = tool_info.get("output").and_then(Value::as_str);
-                        let error = tool_info.get("error").and_then(error_text);
+                        let error = tool_info
+                            .get("error")
+                            .and_then(error_text)
+                            .map(str::to_string)
+                            .or_else(|| match step_state {
+                                "ERROR" => Some("Antigravity tool failed".into()),
+                                "CANCELED" => Some("Antigravity tool was canceled".into()),
+                                _ => None,
+                            });
+                        let is_terminal = step_is_terminal(step_state) || error.is_some();
+                        let is_failed =
+                            matches!(step_state, "ERROR" | "CANCELED") || error.is_some();
 
                         if let Some(part) = find_part_mut(&mut ctx.assistant.parts, &call_id) {
                             if let Some(part_state) = part.state.as_mut() {
                                 if params.is_some() {
                                     part_state.input = params;
                                 }
-                                if is_done {
-                                    part_state.status = if error.is_some() {
-                                        "error"
-                                    } else {
-                                        "completed"
-                                    }
-                                    .into();
+                                if is_terminal {
+                                    part_state.status =
+                                        if is_failed { "error" } else { "completed" }.into();
                                     if let Some(out) = output {
                                         part_state.output = Some(out.to_string());
                                     }
-                                    if let Some(err) = error {
-                                        part_state.error = Some(err.to_string());
+                                    if let Some(err) = &error {
+                                        part_state.error = Some(err.clone());
                                     }
                                 }
                             }
                         } else {
-                            let status = if is_done {
-                                if error.is_some() {
+                            let status = if is_terminal {
+                                if is_failed {
                                     "error"
                                 } else {
                                     "completed"
@@ -541,7 +582,7 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                                     status: status.into(),
                                     input: params,
                                     output: output.map(str::to_string),
-                                    error: error.map(str::to_string),
+                                    error,
                                     title: None,
                                 }),
                                 prompt: None,
@@ -573,6 +614,10 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                 state.turn_errored = true;
                 let error = res.get("error").and_then(error_text).unwrap_or(status);
                 ctx.mark_terminal_failure("antigravity_terminal", format!("Antigravity: {error}"));
+            } else if let Some(error) = denied_actions_error(res) {
+                ctx.mark_delivery(DeliveryState::Accepted);
+                state.turn_errored = true;
+                ctx.mark_terminal_failure("antigravity_permission_denied", error);
             } else {
                 ctx.mark_delivery(DeliveryState::Accepted);
                 ctx.mark_final_text_tail();
@@ -781,12 +826,91 @@ mod tests {
     }
 
     #[test]
-    fn permissions_match_advertised_native_modes() {
-        assert_eq!(permission_args(None, false), ["--mode=default"]);
+    fn failed_tool_states_are_terminal_even_without_error_payloads() {
+        for (step_state, expected_error) in [
+            ("ERROR", "Antigravity tool failed"),
+            ("CANCELED", "Antigravity tool was canceled"),
+        ] {
+            let (ctx, _) = fold(&[json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_index": 1,
+                    "state": step_state,
+                    "step_type": "tool",
+                    "tool_name": "run_command",
+                    "tool_info": {"parameters": {"CommandLine": "false"}}
+                }
+            })]);
+            let tool = ctx.assistant.parts[0].state.as_ref().unwrap();
+            assert_eq!(tool.status, "error", "{step_state}");
+            assert_eq!(tool.error.as_deref(), Some(expected_error), "{step_state}");
+        }
+    }
+
+    #[test]
+    fn an_error_payload_terminates_an_active_tool() {
+        let (ctx, _) = fold(&[json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "ACTIVE",
+                "step_type": "tool",
+                "tool_name": "view_file",
+                "tool_info": {"error": {"message": "Denied"}}
+            }
+        })]);
+        let tool = ctx.assistant.parts[0].state.as_ref().unwrap();
+        assert_eq!(tool.status, "error");
+        assert_eq!(tool.error.as_deref(), Some("Denied"));
+    }
+
+    #[test]
+    fn terminal_agent_response_clears_the_streamed_text_part() {
+        for step_state in ["ERROR", "CANCELED"] {
+            let (_, state) = fold(&[
+                json!({"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"partial"}}),
+                json!({"event":"step_update","step_update":{"step_index":1,"state":step_state,"step_type":"agent_response"}}),
+            ]);
+            assert!(state.text_part_id.is_none(), "{step_state}");
+        }
+    }
+
+    #[test]
+    fn empty_success_with_denied_actions_is_a_failed_turn() {
+        let (ctx, state) = fold(&[json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": "",
+                "denied_actions": [{"action": "command", "display_name": "RunCommand"}]
+            }
+        })]);
+        assert!(state.saw_result);
+        assert!(state.turn_errored);
+        assert_eq!(ctx.delivery_state(), DeliveryState::Accepted);
         assert_eq!(
-            permission_args(Some(PermissionMode::Ask), false),
-            ["--mode=default"]
+            denied_actions_error(&json!({
+                "response": "",
+                "denied_actions": [{"display_name": "RunCommand"}]
+            }))
+            .as_deref(),
+            Some("Antigravity denied required action(s): RunCommand")
         );
+    }
+
+    #[test]
+    fn denied_actions_do_not_discard_a_nonempty_response() {
+        assert!(denied_actions_error(&json!({
+            "response": "I could not run it, but here is an explanation.",
+            "denied_actions": [{"display_name": "RunCommand"}]
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn permissions_match_advertised_native_modes() {
+        assert!(permission_args(None, false).is_empty());
+        assert!(permission_args(Some(PermissionMode::Ask), false).is_empty());
         assert_eq!(
             permission_args(Some(PermissionMode::AcceptEdits), false),
             ["--mode=accept-edits"]
