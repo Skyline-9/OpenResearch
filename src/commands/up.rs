@@ -539,6 +539,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
                 .delete(delete_artifact),
         )
         .route("/api/projects/{id}/files/file", get(serve_artifact))
+        .route("/api/projects/{id}/terminal", get(project_terminal))
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
         .route(
@@ -624,6 +625,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/settings/local", get(local_machine_settings))
         .route("/api/settings/openresearch", get(openresearch_settings))
         .route("/api/settings/openresearch/login", get(openresearch_login))
+        .route("/api/settings/commands/run", get(run_settings_command))
         .route(
             "/api/settings/openresearch/ssh-key",
             get(openresearch_ssh_key),
@@ -763,6 +765,7 @@ fn remote_route_forbidden(path: &str) -> bool {
             | "/api/settings/ssh/connect"
             | "/api/settings/openresearch/ssh-key"
             | "/api/settings/openresearch/login"
+            | "/api/settings/commands/run"
             | "/api/harnesses/setup"
     ) || path.starts_with("/api/remote/")
         || (path.starts_with("/api/projects/") && path.ends_with("/file/open"))
@@ -5489,27 +5492,46 @@ pub(crate) async fn ssh_connect_to_target(
     ws.on_upgrade(move |socket| ssh_connect_socket(socket, host, req.backend, target))
 }
 
+const DEFAULT_PTY_SIZE: PtySize = PtySize {
+    rows: 24,
+    cols: 80,
+    pixel_width: 0,
+    pixel_height: 0,
+};
+
 fn start_pty(program: &str, args: Vec<String>) -> Result<PtySession> {
-    start_pty_with_env(program, args, &[])
+    start_pty_with_env(program, args, &[], DEFAULT_PTY_SIZE, None)
 }
 
 fn start_pty_with_env(
     program: &str,
     args: Vec<String>,
     env: &[(&str, std::ffi::OsString)],
+    size: PtySize,
+    cwd: Option<&std::path::Path>,
 ) -> Result<PtySession> {
     use std::io::{Read as _, Write as _};
 
-    let pair = native_pty_system().openpty(PtySize {
-        rows: 24,
-        cols: 80,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+    let pair = native_pty_system().openpty(size)?;
     let mut command = CommandBuilder::new(program);
     command.args(args);
+    // App mode never puts the imported shell env into the process env, so a
+    // child sees launchd's PATH and config dirs unless they are exported here.
+    if let Some(path) = local::shell_env::search_path() {
+        command.env("PATH", path);
+    }
+    local::shell_env::export_to(|key, value| command.env(key, value));
+    if std::env::var_os("TERM").is_none() {
+        command.env("TERM", "xterm-256color");
+    }
+    if let Some(cwd) = cwd {
+        command.cwd(cwd);
+    }
     for (key, value) in env {
         command.env(key, value);
+    }
+    if let Some(cwd) = cwd {
+        command.cwd(cwd);
     }
     let mut child = pair.slave.spawn_command(command)?;
     drop(pair.slave);
@@ -5613,7 +5635,8 @@ async fn ssh_connect_socket(
             return;
         }
     };
-    let Some(status) = relay_pty(&mut socket, session, None).await else {
+    let mut size = DEFAULT_PTY_SIZE;
+    let Some(status) = relay_pty(&mut socket, session, None, &mut size).await else {
         return;
     };
 
@@ -5661,10 +5684,25 @@ async fn ssh_connect_socket(
     }
 }
 
+/// Record a client resize message in `size`; false when it is not one.
+fn apply_resize(size: &mut PtySize, text: &str) -> bool {
+    match serde_json::from_str(text) {
+        Ok(SshTerminalInput::Resize { cols, rows }) if cols > 0 && rows > 0 => {
+            size.rows = rows;
+            size.cols = cols;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Relay one PTY session; `size` follows the client's resizes so a session
+/// started afterwards can open at the terminal's real dimensions.
 async fn relay_pty(
     socket: &mut WebSocket,
     session: PtySession,
     mut output: Option<&mut String>,
+    size: &mut PtySize,
 ) -> Option<std::result::Result<portable_pty::ExitStatus, String>> {
     let PtySession {
         master,
@@ -5700,15 +5738,8 @@ async fn relay_pty(
                     }
                 }
                 Some(Ok(Message::Text(text))) => {
-                    if let Ok(SshTerminalInput::Resize { cols, rows }) = serde_json::from_str(&text) {
-                        if cols > 0 && rows > 0 {
-                            let _ = master.resize(PtySize {
-                                rows,
-                                cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            });
-                        }
+                    if apply_resize(size, &text) {
+                        let _ = master.resize(*size);
                     }
                 }
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return None,
@@ -5737,6 +5768,87 @@ async fn relay_pty(
     Some(status)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectTerminalReq {
+    session_id: Option<String>,
+}
+
+async fn project_terminal(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    Path(id): Path<String>,
+    Query(req): Query<ProjectTerminalReq>,
+) -> Response {
+    if let Some(rejected) = reject_cross_origin(&headers) {
+        return rejected;
+    }
+    ws.on_upgrade(move |mut socket| async move {
+        let mut size = DEFAULT_PTY_SIZE;
+        let started = tokio::task::spawn_blocking(move || {
+            let root = project_terminal_root(&id, req.session_id.as_deref())?;
+            let (shell, args) = interactive_shell();
+            start_pty_with_env(&shell, args, &[], size, Some(&root))
+        })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result);
+        let session = match started {
+            Ok(session) => session,
+            Err(error) => {
+                send_terminal_error(&mut socket, error).await;
+                return;
+            }
+        };
+        let Some(status) = relay_pty(&mut socket, session, None, &mut size).await else {
+            return;
+        };
+        match status {
+            Ok(status) => {
+                let message = json!({ "type": "exit", "code": status.exit_code() });
+                let _ = socket.send(Message::Text(message.to_string().into())).await;
+            }
+            Err(error) => send_terminal_error(&mut socket, anyhow!(error)).await,
+        }
+    })
+}
+
+/// The session worktree or, without a session, the project clone.
+fn project_terminal_root(project_id: &str, session_id: Option<&str>) -> Result<std::path::PathBuf> {
+    let store = Store::open()?;
+    let project = store
+        .get_local_project(project_id)?
+        .ok_or_else(|| anyhow!("project not found"))?;
+    let session_id = session_id.map(str::trim).filter(|s| !s.is_empty());
+    let root = match session_id {
+        Some(session_id) => {
+            let session = store
+                .get_chat_session(session_id)?
+                .filter(|session| session.project_id == project.id)
+                .ok_or_else(|| anyhow!("chat session not found"))?;
+            session_checkout_root(&store, &project, &session.id)
+        }
+        None => resolve_checkout_root(&store, &project, None).map(|(root, _)| root),
+    };
+    root.map_err(|ApiError(_, message)| anyhow!(message))
+}
+
+/// The worktree the harness will create on its first turn, so a command run
+/// before any message acts on the same checkout the agent sees.
+fn session_checkout_root(
+    store: &Store,
+    project: &local::model::LocalProject,
+    session_id: &str,
+) -> std::result::Result<std::path::PathBuf, ApiError> {
+    match local::git::ensure_session_worktree(project, session_id) {
+        Ok(dir) => Ok(crate::paths::canonicalize(&dir).unwrap_or(dir)),
+        Err(error) => {
+            eprintln!("orx up: session worktree unavailable, using the clone: {error}");
+            resolve_checkout_root(store, project, Some(session_id)).map(|(root, _)| root)
+        }
+    }
+}
+
 async fn openresearch_login(headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
     openresearch_terminal(headers, ws, vec!["login".into()]).await
 }
@@ -5750,39 +5862,159 @@ async fn openresearch_terminal(
     ws: WebSocketUpgrade,
     args: Vec<String>,
 ) -> Response {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe.to_string_lossy().into_owned(),
-        Err(error) => return ApiError::from(anyhow!(error)).into_response(),
+    let program = std::env::current_exe()
+        .map(|exe| exe.to_string_lossy().into_owned())
+        .map_err(anyhow::Error::from);
+    command_terminal(&headers, ws, program, args, false).await
+}
+
+/// Commands the settings page may run, keyed by the exact note text. The
+/// loopback and origin guards are the security boundary (the session ends in
+/// the user's shell anyway); this list only keeps the button honest.
+const SETTINGS_COMMANDS: &[(&str, &[&str])] = &[
+    ("gh auth login", &["gh", "auth", "login"]),
+    ("hf auth login", &["hf", "auth", "login"]),
+    ("claude auth status", &["claude", "auth", "status"]),
+];
+
+fn settings_command(command: &str) -> Option<&'static [&'static str]> {
+    SETTINGS_COMMANDS
+        .iter()
+        .find(|(text, _)| *text == command)
+        .map(|(_, argv)| *argv)
+}
+
+#[derive(Deserialize)]
+struct RunSettingsCommandReq {
+    command: String,
+}
+
+async fn run_settings_command(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    Query(req): Query<RunSettingsCommandReq>,
+) -> Response {
+    // Before the allowlist reply, so a cross-origin page learns nothing.
+    if let Some(rejected) = reject_cross_origin(&headers) {
+        return rejected;
+    }
+    let Some(argv) = settings_command(req.command.trim()) else {
+        return bad_request("command is not runnable from settings").into_response();
     };
-    if !same_origin(&headers) {
-        return ApiError(
-            StatusCode::FORBIDDEN,
-            "Login terminal origin rejected".into(),
-        )
-        .into_response();
+    let program = local::shell_env::find_on_path(argv[0])
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow!("{} is not installed", argv[0]));
+    let args = argv[1..].iter().map(|arg| arg.to_string()).collect();
+    command_terminal(&headers, ws, program, args, true).await
+}
+
+/// The user's interactive login shell, so follow-up commands see the PATH a
+/// fresh terminal would (an installer that just added `~/.local/bin`, say).
+fn interactive_shell() -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        (shell, Vec::new())
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (shell, vec!["-i".to_string(), "-l".to_string()])
+    }
+}
+
+fn reject_cross_origin(headers: &HeaderMap) -> Option<Response> {
+    (!same_origin(headers))
+        .then(|| ApiError(StatusCode::FORBIDDEN, "Terminal origin rejected".into()).into_response())
+}
+
+/// Run `program` in a PTY relayed over the websocket. With `shell_after`, a
+/// command that ran is followed by the user's interactive shell in the same
+/// terminal, at the size the client last reported.
+async fn command_terminal(
+    headers: &HeaderMap,
+    ws: WebSocketUpgrade,
+    program: Result<String>,
+    args: Vec<String>,
+    shell_after: bool,
+) -> Response {
+    if let Some(rejected) = reject_cross_origin(headers) {
+        return rejected;
     }
     ws.on_upgrade(move |mut socket| async move {
+        let mut size = DEFAULT_PTY_SIZE;
+        let started = match program {
+            Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
+            Err(error) => Err(error),
+        };
+        let session = match started {
+            Ok(session) => session,
+            Err(error) => {
+                send_terminal_error(&mut socket, error).await;
+                return;
+            }
+        };
+        let Some(status) = relay_pty(&mut socket, session, None, &mut size).await else {
+            return;
+        };
         let result = async {
-            let session = tokio::task::spawn_blocking(move || start_pty(&exe, args)).await??;
-            let Some(status) = relay_pty(&mut socket, session, None).await else {
-                return Ok::<_, anyhow::Error>(None);
-            };
             let status = status.map_err(|error| anyhow!(error))?;
             anyhow::ensure!(
                 status.success(),
                 "Command exited with code {}",
                 status.exit_code()
             );
-            Ok(Some(()))
+            Ok::<_, anyhow::Error>(())
         }
         .await;
         let message = match result {
-            Ok(Some(())) => json!({ "type": "complete" }),
-            Ok(None) => return,
+            Ok(()) => json!({ "type": "complete" }),
             Err(error) => json!({ "type": "error", "error": error.to_string() }),
         };
-        let _ = socket.send(Message::Text(message.to_string().into())).await;
+        if socket
+            .send(Message::Text(message.to_string().into()))
+            .await
+            .is_err()
+            || !shell_after
+        {
+            return;
+        }
+        continue_in_shell(&mut socket, &mut size, Vec::new()).await;
     })
+}
+
+/// Hand the terminal to the user's interactive shell, with any env the command
+/// before it needed (OpenCode's isolated store), so follow-ups land in the
+/// same place.
+async fn continue_in_shell(
+    socket: &mut WebSocket,
+    size: &mut PtySize,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+) {
+    let (shell, args) = interactive_shell();
+    match spawn_pty(shell, args, env, *size).await {
+        Ok(session) => {
+            relay_pty(socket, session, None, size).await;
+        }
+        Err(error) => send_terminal_error(socket, error).await,
+    }
+}
+
+async fn spawn_pty(
+    program: String,
+    args: Vec<String>,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+    size: PtySize,
+) -> Result<PtySession> {
+    tokio::task::spawn_blocking(move || start_pty_with_env(&program, args, &env, size, None))
+        .await?
+}
+
+async fn send_terminal_error(socket: &mut WebSocket, error: anyhow::Error) {
+    let _ = socket
+        .send(Message::Text(
+            json!({ "type": "error", "error": error.to_string() })
+                .to_string()
+                .into(),
+        ))
+        .await;
 }
 
 /// Concrete Host entries from `~/.ssh/config` (wildcard patterns skipped) —
@@ -7070,15 +7302,7 @@ async fn run_shell_command(
         let project = store
             .get_local_project(&session.project_id)?
             .ok_or_else(|| not_found("project"))?;
-        // The worktree the harness will create on its first turn, so a command
-        // run before any message acts on the same checkout the agent sees.
-        match local::git::ensure_session_worktree(&project, &session.id) {
-            Ok(dir) => Ok(crate::paths::canonicalize(&dir).unwrap_or(dir)),
-            Err(error) => {
-                eprintln!("orx up: session worktree unavailable, using the clone: {error}");
-                resolve_checkout_root(&store, &project, Some(&session_id)).map(|(root, _)| root)
-            }
-        }
+        session_checkout_root(&store, &project, &session.id)
     })
     .await
     .map_err(|e| ApiError::from(anyhow!("shell task failed: {e}")))??;
@@ -7893,6 +8117,7 @@ mod tests {
             "/api/settings/ssh/connect",
             "/api/settings/openresearch/login",
             "/api/settings/openresearch/ssh-key",
+            "/api/settings/commands/run",
             "/api/remote/sessions",
             "/api/projects/p1/file/open",
         ] {
@@ -8015,6 +8240,32 @@ mod tests {
         })
         .await
         .expect("cancelled PTY did not exit");
+    }
+
+    #[test]
+    fn client_resizes_update_the_tracked_size_only_when_valid() {
+        let mut size = DEFAULT_PTY_SIZE;
+        assert!(apply_resize(
+            &mut size,
+            r#"{"type":"resize","cols":111,"rows":33}"#
+        ));
+        assert_eq!((size.cols, size.rows), (111, 33));
+        assert!(!apply_resize(
+            &mut size,
+            r#"{"type":"resize","cols":0,"rows":9}"#
+        ));
+        assert!(!apply_resize(&mut size, "not json"));
+        assert_eq!((size.cols, size.rows), (111, 33));
+    }
+
+    #[test]
+    fn settings_commands_are_an_exact_allowlist() {
+        assert_eq!(
+            settings_command("gh auth login"),
+            Some(&["gh", "auth", "login"][..])
+        );
+        assert_eq!(settings_command("gh auth login; rm -rf ~"), None);
+        assert_eq!(settings_command("gh"), None);
     }
 
     #[tokio::test]
