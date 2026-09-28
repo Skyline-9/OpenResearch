@@ -81,14 +81,14 @@ enum Command {
     /// List a project's runs.
     Runs(RunsArgs),
 
-    /// Read a run's terminal log (tail by default).
+    /// Show a run's compact log summary (path, size, and preview) by default.
     Logs(LogsArgs),
 
     /// Add an experiment node to a local `orx up` project.
     #[command(name = "create-experiment")]
     CreateExperiment(CreateExperimentArgs),
 
-    /// List the GPU compute catalog.
+    /// Configure compute backends, test connections, and browse offers.
     Compute(ComputeArgs),
 
     /// Spin up standalone compute in an organization (no experiment).
@@ -117,7 +117,7 @@ enum Command {
     /// Call one paper-retrieval primitive; the caller owns the search loop.
     Discover(DiscoverArgs),
 
-    /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv metadata.
+    /// Fetch a paper: alphaXiv report/full-text, or OpenAlex/bioRxiv/PubMed metadata.
     /// The source is auto-detected from the id (override with `--source`).
     Paper(PaperArgs),
 
@@ -147,6 +147,10 @@ enum Command {
 
     /// Turn anonymous usage analytics on or off, or show current status.
     Telemetry(TelemetryArgs),
+
+    /// Report a bug, feature request, or frustration with OpenResearch itself
+    /// to its maintainers. Filed by the agent; see the `orx-feedback` skill.
+    Feedback(FeedbackArgs),
 
     /// Internal: the Claude plan-mode `PreToolUse` hook body. Reads the hook
     /// payload on stdin and prints an allow decision for read-only `orx`
@@ -237,15 +241,6 @@ pub struct RunsArgs {
 #[derive(Args, Debug)]
 pub struct LogsArgs {
     pub run_id: String,
-    /// Read from the start instead of the tail.
-    #[arg(long)]
-    pub head: bool,
-    /// Max bytes to read.
-    #[arg(long)]
-    pub bytes: Option<String>,
-    /// Exact byte window `<start>:<end>`.
-    #[arg(long)]
-    pub range: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -273,19 +268,13 @@ pub struct CreateExperimentArgs {
 
 #[derive(Args, Debug)]
 pub struct ComputeArgs {
-    /// List CPU-only instance offers instead of the GPU catalog. CPU instances
-    /// suit GPU-less experiments (data prep, eval harnesses, CPU-bound papers).
-    #[arg(long)]
-    pub cpu: bool,
-    /// Filter to one GPU id (e.g. `H100_SXM`). Case-insensitive. GPU mode only.
-    #[arg(long)]
-    pub gpu: Option<String>,
-    /// Filter to a specific GPU count per instance. GPU mode only.
-    #[arg(long)]
-    pub count: Option<i64>,
-    /// Filter to one provider (e.g. `runpod`, `vast`, `lambda`). Case-insensitive. GPU mode only.
-    #[arg(long)]
-    pub provider: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<commands::compute::ComputeCommand>,
+    /// Machine-readable output.
+    #[arg(long, global = true)]
+    pub json: bool,
+    #[command(flatten)]
+    pub catalog: commands::compute::CatalogArgs,
 }
 
 #[derive(Args, Debug)]
@@ -408,7 +397,12 @@ pub struct ExpArgs {
 #[derive(Subcommand, Debug)]
 pub enum ExpCommand {
     /// Show the experiment's status, run command, and latest run.
-    Status { exp_id: String },
+    Status {
+        exp_id: String,
+        /// Query live Slurm accounting in addition to locally stored status.
+        #[arg(long)]
+        scheduler: bool,
+    },
 
     /// View the experiment's description/notes, or overwrite it with `--set` / `--stdin`.
     Desc {
@@ -492,11 +486,17 @@ pub struct ExpRunArgs {
     /// you belong to exactly one org.
     #[arg(long)]
     pub org: Option<String>,
-    /// The ~/.ssh/config host alias to run on (with `--backend ssh`), or the
+    /// The ~/.ssh/config host alias (SSH defaults to its saved default host), or the
     /// cluster login node (with `--backend slurm`; defaults to the slurm
     /// settings' host).
     #[arg(long)]
     pub host: Option<String>,
+    /// Existing running Docker container on the SSH host (name or ID).
+    #[arg(long, conflicts_with = "no_container")]
+    pub container: Option<String>,
+    /// Run directly on the SSH host, overriding its saved container.
+    #[arg(long)]
+    pub no_container: bool,
     /// Repo-relative path to the k8s manifest on the experiment branch (with
     /// `--backend k8s`; default .orx/k8s.yaml). The manifest declares the run's
     /// resources — image, GPUs, topology — and orx injects the run script, env
@@ -642,6 +642,33 @@ pub enum TelemetryCommand {
     Off,
 }
 
+#[derive(Args, Debug)]
+pub struct FeedbackArgs {
+    #[arg(long, value_enum)]
+    pub kind: FeedbackKind,
+    /// One line, at most 200 characters.
+    #[arg(long)]
+    pub summary: String,
+    /// What happened and what was expected, the steps in words, the gist of
+    /// any error, and any workaround; at most 4000 characters. Never include
+    /// research details, paths, or names.
+    #[arg(long)]
+    pub details: String,
+    /// The user's own words, rephrased to strip research details; at most 1000
+    /// characters.
+    #[arg(long)]
+    pub quote: Option<String>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[value(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    Bug,
+    FeatureRequest,
+    Frustration,
+}
+
 /// Which corpus a literature command searches or reads from.
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 #[value(rename_all = "lower")]
@@ -652,6 +679,8 @@ pub enum LitSource {
     Openalex,
     /// bioRxiv biology preprints (searched via OpenAlex, fetched via bioRxiv).
     Biorxiv,
+    /// PubMed biomedical literature (NCBI E-utilities).
+    Pubmed,
 }
 
 impl LitSource {
@@ -663,6 +692,7 @@ impl LitSource {
             LitSource::Alphaxiv => "alphaxiv",
             LitSource::Openalex => "openalex",
             LitSource::Biorxiv => "biorxiv",
+            LitSource::Pubmed => "pubmed",
         }
     }
 
@@ -672,6 +702,7 @@ impl LitSource {
             LitSource::Alphaxiv => "alphaXiv",
             LitSource::Openalex => "OpenAlex",
             LitSource::Biorxiv => "bioRxiv",
+            LitSource::Pubmed => "PubMed",
         }
     }
 }
@@ -692,6 +723,8 @@ pub enum DiscoverCommand {
     Openalex(DiscoverySearchArgs),
     /// bioRxiv preprint search through OpenAlex's bioRxiv source index.
     Biorxiv(DiscoverySearchArgs),
+    /// PubMed biomedical literature search through NCBI E-utilities.
+    Pubmed(DiscoverySearchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -791,13 +824,13 @@ pub enum DeleteCommand {
 #[derive(Args, Debug)]
 pub struct PaperArgs {
     /// Paper id: an arXiv id / URL (alphaXiv), a DOI (bioRxiv `10.1101/…` or any
-    /// other), or an OpenAlex `W…` id. The source is auto-detected.
+    /// other), an OpenAlex `W…` id, or a PubMed PMID / URL. The source is auto-detected.
     pub id: String,
     /// Force the source instead of auto-detecting it from the id.
     #[arg(long, value_enum)]
     pub source: Option<LitSource>,
     /// Fetch the full extracted paper text instead of the report (alphaXiv only;
-    /// OpenAlex/bioRxiv have no extracted full text and point you at the PDF).
+    /// OpenAlex/bioRxiv/PubMed have no extracted full text and point you at a full-text link).
     #[arg(long)]
     pub full: bool,
 }
@@ -897,7 +930,7 @@ async fn main() {
 
     let warning = (!matches!(
         command,
-        Command::Version(_) | Command::Update(_) | Command::Delete(_)
+        Command::Version(_) | Command::Update(_) | Command::Delete(_) | Command::Feedback(_)
     ))
     .then(updates::UpdateWarning::start);
 
@@ -1034,6 +1067,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Supervise(_) => "supervise",
         Command::Up(_) => "up",
         Command::Telemetry(_) => "telemetry",
+        Command::Feedback(_) => "feedback",
         Command::PlanGate => "plan-gate",
         Command::McpGate => "mcp-gate",
         Command::AntigravityGate => "antigravity-gate",
@@ -1087,6 +1121,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
             None => commands::up::run(args).await,
         },
         Command::Telemetry(args) => commands::telemetry::run(args).await,
+        Command::Feedback(args) => commands::feedback::run(args).await,
         // Handled before dispatch (fast path, no telemetry/update check).
         Command::PlanGate => commands::plan_gate::run().await,
         Command::McpGate => commands::mcp_gate::run().await,
@@ -1107,6 +1142,7 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
             | Command::Version(_)
             | Command::Delete(_)
             | Command::Telemetry(_)
+            | Command::Feedback(_)
             | Command::PlanGate
             | Command::McpGate
             | Command::AntigravityGate
@@ -1194,10 +1230,11 @@ mod cli_tests {
     }
 
     #[test]
-    fn discover_parses_openalex_and_biorxiv_primitives() {
+    fn discover_parses_openalex_biorxiv_and_pubmed_primitives() {
         for (source, expected) in [
             ("openalex", LitSource::Openalex),
             ("biorxiv", LitSource::Biorxiv),
+            ("pubmed", LitSource::Pubmed),
         ] {
             let cli = Cli::try_parse_from(["orx", "discover", source, "protein folding"])
                 .expect("source discovery should parse");
@@ -1207,6 +1244,7 @@ mod cli_tests {
             let actual = match command {
                 DiscoverCommand::Openalex(_) => LitSource::Openalex,
                 DiscoverCommand::Biorxiv(_) => LitSource::Biorxiv,
+                DiscoverCommand::Pubmed(_) => LitSource::Pubmed,
                 _ => panic!("expected non-alphaXiv discovery source"),
             };
             assert_eq!(actual, expected);
