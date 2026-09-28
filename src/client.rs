@@ -1738,19 +1738,23 @@ mod tests {
         assert_eq!(latest.published, "10.1000/j.x");
     }
 
-    /// A transport failure must surface its underlying cause, not just
-    /// reqwest's generic "error sending request" wrapper. Regression guard for
-    /// TLS failures behind an inspecting proxy, where `UnknownIssuer` is the
-    /// only actionable detail and lives two levels down the source chain.
     #[tokio::test]
     async fn transport_error_includes_the_source_chain() {
-        // Port 1 is reserved and never listening, so this fails at connect
-        // with an OS-level cause nested under reqwest's wrapper.
-        let err = reqwest::Client::new()
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback client")
             .get("http://127.0.0.1:1/unreachable")
             .send()
             .await
             .expect_err("connection to port 1 must fail");
+
+        let mut cause = std::error::Error::source(&err).expect("transport error has a cause");
+        while let Some(next) = std::error::Error::source(cause) {
+            cause = next;
+        }
+        let deepest_cause = cause.to_string();
+        assert!(!err.to_string().contains(&deepest_cause));
 
         let rendered = super::transport_error("https://api.example.test", err).to_string();
 
@@ -1758,10 +1762,9 @@ mod tests {
             rendered.starts_with("Could not reach alphaXiv at https://api.example.test: "),
             "prefix preserved: {rendered}"
         );
-        // The cause chain contributed detail beyond reqwest's own Display.
         assert!(
-            rendered.matches(": ").count() >= 2,
-            "cause chain appended: {rendered}"
+            rendered.contains(&deepest_cause),
+            "deepest cause {deepest_cause:?} missing: {rendered}"
         );
     }
 }
